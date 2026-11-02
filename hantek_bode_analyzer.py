@@ -1,31 +1,16 @@
 """Automated Frequency Response Analyzer (Bode Plotter) for Hantek DSO2D10.
 
 ========================================================================
-Architecture Overview:
-----------------------
-This production-grade measurement tool controls a Hantek DSO2D10 digital
-storage oscilloscope and its integrated DDS waveform generator to execute
-a fully automated frequency sweep (10 Hz to 25 MHz).
-
-Key Architectural Components:
-1. Low-Level Instrument I/O (SCPI / PyVISA):
-   - High-throughput raw binary waveform acquisition via proprietary SCPI commands.
-   - Non-blocking error recovery and automatic communication timeout tuning.
-2. Digital Signal Processing (DSP):
-   - Coherent Single-Bin Discrete Fourier Transform (DFT) with Hann windowing
-     to eliminate spectral leakage without assumptions about filter type or order.
-   - Automated -3 dB cut-off frequency detection via sub-bin log-interpolation.
-   - Dynamic noise floor and parasitic coupling boundary classification.
-   - Intelligent stopband phase handling: boundary detection triggers where parasitic
-     crosstalk begins, and phase axis scaling is strictly bounded to the physical
-     filter passband to prevent visual distortion.
-3. Interactive Visualization Engine (Matplotlib):
-   - Real-time time-domain signal reconstruction synced with Bode magnitude and phase.
-   - Center-seeking zero-crossing phase-lag dimensioning (Delta-t).
-   - High-performance idle redraw triggers without memory leaks.
-
-Author: Mechatronics Engineering Pipeline
-License: MIT License
+Key Enhancements:
+1. Universal Filter Topology Detection:
+   - Automatically classifies Low-Pass vs. High-Pass vs. Flat passbands.
+   - Accurately classifies parasitic noise boundaries on the appropriate side
+     (left for high-pass, right for low-pass).
+2. Sub-Sample Interpolated Zero-Crossing Dimensioning (Delta-t):
+   - Computes real rising zero-crossings for both CH1 and CH2 via linear interpolation.
+   - Correctly anchors phase lead (Delta-t < 0 / CH2 ahead) and phase lag (Delta-t > 0).
+3. Dynamic Passband Axis Scaling:
+   - Symmetrically bounds the phase axis to prevent visual blowout from stopband noise.
 """
 
 from __future__ import annotations
@@ -37,12 +22,10 @@ import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
 import numpy as np
 import pyvisa
-from scipy.signal import savgol_filter
 
-# Global UI configuration: eliminate standard toolbar for an embedded feel
+# Global UI configuration
 plt.rcParams["toolbar"] = "None"
 
-# Standard 1-2-5 oscilloscope timebase increments (seconds per division)[cite: 5]
 TIMEBASE_STEPS: Tuple[float, ...] = (
     2e-9, 5e-9, 10e-9, 20e-9, 50e-9,
     100e-9, 200e-9, 500e-9,
@@ -61,37 +44,16 @@ DDS_STIMULUS_VPP: float = 2.0
 FIXED_VDIV_VOLTS: float = 0.5
 
 
-# ==============================================================================
-# Signal Processing and Instrument Control Routines
-# ==============================================================================
-
 def get_optimal_timebase(freq_hz: float) -> float:
-    """Calculates optimal timebase scale to display ~3.5 cycles across 14 divisions.
-
-    Args:
-        freq_hz: Excitation frequency in Hertz.
-
-    Returns:
-        Closest discrete timebase setting supported by the DSO hardware in s/div.
-    """
     target_timebase = 3.5 / (14.0 * freq_hz)
     return min(TIMEBASE_STEPS, key=lambda tb: abs(tb - target_timebase))
 
 
 def fetch_waveform_raw(scope_inst: pyvisa.resources.MessageBasedResource) -> bytes:
-    """Acquires raw 8000-byte acquisition record directly from hardware buffer[cite: 5].
-
-    Args:
-        scope_inst: Active PyVISA instrument connection.
-
-    Returns:
-        Combined binary waveform payload, or empty bytes on communication failure.
-    """
     samples_total = -1
     samples_data: Optional[bytearray] = None
     samples_received = 0
 
-    # Retry loop with micro-sleeps to absorb internal ARM bus contention
     for _ in range(6):
         try:
             scope_inst.write("PRIVate:WAVeform:DATA:ALL?")
@@ -127,20 +89,6 @@ def compute_spectral_point(
     sample_interval_s: float,
     frequency_hz: float,
 ) -> Tuple[float, float, float]:
-    """Computes transfer function magnitude and phase using windowed Fourier projection.
-
-    A symmetric Hann window is applied prior to projection to suppress spectral leakage
-    and prevent noise contamination from incomplete terminal periods.
-
-    Args:
-        ch1_voltage: Voltage array of reference excitation (CH1).
-        ch2_voltage: Voltage array of device under test output (CH2).
-        sample_interval_s: Delta time between consecutive digitizer samples.
-        frequency_hz: Excitation frequency in Hertz.
-
-    Returns:
-        A tuple of (gain_db, phase_degrees, output_amplitude_volts).
-    """
     num_samples = len(ch1_voltage)
     window = np.hanning(num_samples)
     w_ch1 = ch1_voltage * window
@@ -177,10 +125,7 @@ scope.read_termination = "\n"
 device_identity = scope.query("*IDN?").strip()
 print(f"[HW-INIT] Connected to: {device_identity}")
 
-# Configure integrated DDS signal generator[cite: 5]
 scope.write(f":DDS:TYPE SINE;:DDS:AMP {DDS_STIMULUS_VPP:.1f};:DDS:SWIT ON")
-
-# Apply deterministic analog input scaling
 scope.write(f":CHANnel1:SCALe {FIXED_VDIV_VOLTS:.2f}")
 scope.write(f":CHANnel2:SCALe {FIXED_VDIV_VOLTS:.2f}")
 time.sleep(0.1)
@@ -302,71 +247,69 @@ if not sweep_records:
 
 
 # ==============================================================================
-# Analytical Post-Processing & Limit Classification
+# Analytical Post-Processing: Topology & Boundary Classification
 # ==============================================================================
 
 freqs_array = np.array(raw_freqs)
 mag_db_array = np.array(raw_mag_db)
 phase_deg_array = np.array(raw_phase_deg)
 amps2_array = np.array(raw_amps_ch2)
+unwrapped_phase_array = np.rad2deg(np.unwrap(np.deg2rad(phase_deg_array)))
 
-# --- 3.1 Cut-Off Frequency Detection (-3 dB relative to passband level) ---
+# Determine filter character (Low-Pass vs. High-Pass)
+# Low-pass has high gain at start and low at end; High-pass is vice-versa
+start_gain_median = float(np.median(mag_db_array[:5]))
+end_gain_median = float(np.median(mag_db_array[-5:]))
+is_highpass = end_gain_median > (start_gain_median + 6.0)
+
 passband_reference_db = float(np.percentile(mag_db_array, 90))
 cutoff_target_db = passband_reference_db - 3.01
 detected_cutoff_hz: Optional[float] = None
 idx_cutoff_band: int = 0
 
-crossing_indices = np.where(np.diff(mag_db_array < cutoff_target_db))[0]
+crossing_indices = np.where(np.diff(mag_db_array >= cutoff_target_db))[0]
 if len(crossing_indices) > 0:
-    idx_cutoff_band = crossing_indices[0]
+    # Pick the appropriate transition point
+    idx_cutoff_band = crossing_indices[0] if is_highpass else crossing_indices[-1]
     f_lower, f_upper = freqs_array[idx_cutoff_band], freqs_array[idx_cutoff_band + 1]
     g_lower, g_upper = mag_db_array[idx_cutoff_band], mag_db_array[idx_cutoff_band + 1]
     if g_upper != g_lower:
         log_fc = np.interp(
             cutoff_target_db,
             [min(g_lower, g_upper), max(g_lower, g_upper)],
-            [np.log10(f_upper), np.log10(f_lower)] if g_lower > g_upper else [np.log10(f_lower), np.log10(f_upper)],
+            [np.log10(f_lower), np.log10(f_upper)] if g_lower < g_upper else [np.log10(f_upper), np.log10(f_lower)],
         )
         detected_cutoff_hz = 10.0**log_fc
 
-# --- 3.2 Dynamic Noise Floor & Parasitic Limit Detection ---
-unwrapped_phase_array = np.rad2deg(np.unwrap(np.deg2rad(phase_deg_array)))
+# --- Bidirectional Noise Floor / Parasitic Limit Detection ---
+# Identifies points dominated by ADC quantization floor or crosstalk (< -36 dB or < 18 mV)
+noise_floor_mask = (mag_db_array <= -36.0) | (amps2_array < 0.018)
 
-# Parasitic limit criteria:
-# 1. Magnitude drops below -38 dB or output voltage drops below 18 mV
-past_cutoff_selector = np.arange(len(mag_db_array)) >= idx_cutoff_band
-hit_noise_indices = np.where(past_cutoff_selector & ((mag_db_array <= -38.0) | (amps2_array < 0.018)))[0]
-mag_limit_idx = hit_noise_indices[0] if len(hit_noise_indices) > 0 else len(mag_db_array) - 1
+if is_highpass:
+    # Stopband is at LOW frequencies (left side)
+    # Search backwards from cutoff to find where reliable passband/transition ends
+    stopband_indices = np.where(noise_floor_mask & (np.arange(len(mag_db_array)) <= idx_cutoff_band))[0]
+    left_boundary_idx = int(np.max(stopband_indices)) if len(stopband_indices) > 0 else 0
 
-# 2. Phase reaches physical minimum and turns back up (+4° reversal from minimum)
-phase_limit_idx = len(unwrapped_phase_array) - 1
-if np.any(past_cutoff_selector):
-    past_indices = np.where(past_cutoff_selector)[0]
-    min_phase_idx_local = int(np.argmin(unwrapped_phase_array[past_indices]))
-    global_min_phase_idx = past_indices[min_phase_idx_local]
-    phase_reversal = np.where(
-        (np.arange(len(unwrapped_phase_array)) > global_min_phase_idx) &
-        (unwrapped_phase_array > unwrapped_phase_array[global_min_phase_idx] + 4.0)
-    )[0]
-    if len(phase_reversal) > 0:
-        phase_limit_idx = global_min_phase_idx
+    f_valid = freqs_array[left_boundary_idx:]
+    mag_valid = mag_db_array[left_boundary_idx:]
+    phase_valid = unwrapped_phase_array[left_boundary_idx:]
 
-# Boundary transitions exactly where crosstalk begins to dominate
-boundary_idx = min(mag_limit_idx, phase_limit_idx)
-parasitic_limit_hz = freqs_array[boundary_idx] if boundary_idx < len(freqs_array) - 2 else None
-
-# Partition datasets strictly at boundary_idx
-if parasitic_limit_hz:
-    f_valid = freqs_array[:boundary_idx+1]
-    mag_valid = mag_db_array[:boundary_idx+1]
-    phase_valid = unwrapped_phase_array[:boundary_idx+1]
-
-    f_parasitic = freqs_array[boundary_idx:]
-    mag_parasitic = mag_db_array[boundary_idx:]
-    phase_parasitic = unwrapped_phase_array[boundary_idx:]
+    f_parasitic = freqs_array[:left_boundary_idx+1]
+    mag_parasitic = mag_db_array[:left_boundary_idx+1]
+    phase_parasitic = unwrapped_phase_array[:left_boundary_idx+1]
 else:
-    f_valid, mag_valid, phase_valid = freqs_array, mag_db_array, unwrapped_phase_array
-    f_parasitic, mag_parasitic, phase_parasitic = [], [], []
+    # Low-pass: Stopband is at HIGH frequencies (right side)
+    stopband_indices = np.where(noise_floor_mask & (np.arange(len(mag_db_array)) >= idx_cutoff_band))[0]
+    right_boundary_idx = int(np.min(stopband_indices)) if len(stopband_indices) > 0 else len(mag_db_array) - 1
+
+    f_valid = freqs_array[:right_boundary_idx+1]
+    mag_valid = mag_db_array[:right_boundary_idx+1]
+    phase_valid = unwrapped_phase_array[:right_boundary_idx+1]
+
+    f_parasitic = freqs_array[right_boundary_idx:]
+    mag_parasitic = mag_db_array[right_boundary_idx:]
+    phase_parasitic = unwrapped_phase_array[right_boundary_idx:]
 
 
 # ==============================================================================
@@ -434,7 +377,7 @@ ax_oscilloscope.legend(loc="upper right")
 ax_magnitude.semilogx(f_valid, mag_valid, color="tab:blue", lw=2.0, label="Magnitude Response")
 if len(f_parasitic) > 0:
     ax_magnitude.semilogx(
-        f_parasitic, mag_parasitic, color="crimson", lw=2.0, linestyle="--", label="Parasitic Coupling"
+        f_parasitic, mag_parasitic, color="crimson", lw=2.0, linestyle="--", label="Parasitic / Noise"
     )
 
 cursor_mag_marker, = ax_magnitude.plot([initial_record["freq_hz"]], [mag_db_array[0]], "ro", ms=7)
@@ -450,7 +393,7 @@ if detected_cutoff_hz:
 ax_magnitude.set_ylabel("Magnitude [dB]")
 ax_magnitude.set_title("Bode Diagram: Magnitude Response", fontsize=11)
 ax_magnitude.grid(True, which="both", linestyle="--", alpha=0.5)
-ax_magnitude.legend(loc="lower left", fontsize=8)
+ax_magnitude.legend(loc="lower left" if is_highpass else "lower left", fontsize=8)
 
 # --- 3. Bode Phase Axis ---
 ax_phase.semilogx(f_valid, phase_valid, color="tab:orange", lw=2.0, label="Phase Response")
@@ -472,14 +415,12 @@ ax_phase.set_ylabel("Phase [°]")
 ax_phase.set_xlabel("Frequency [Hz]")
 ax_phase.set_title("Bode Diagram: Phase Response", fontsize=11)
 ax_phase.grid(True, which="both", linestyle="--", alpha=0.5)
-ax_phase.legend(loc="lower left", fontsize=8)
+ax_phase.legend(loc="lower left" if not is_highpass else "lower left", fontsize=8)
 
-# Bound phase scale strictly to valid physical filter range to prevent noise blowout
+# Auto-range phase response cleanly for either HP (0..+90°) or LP (0..-90°)
 min_p = float(np.min(phase_valid))
 max_p = float(np.max(phase_valid))
-y_phase_lower = min(-95.0, min_p - 15.0)
-y_phase_upper = max(10.0, max_p + 10.0)
-ax_phase.set_ylim(y_phase_lower, y_phase_upper)
+ax_phase.set_ylim(min(-15.0, min_p - 15.0), max(15.0, max_p + 15.0))
 
 
 # ==============================================================================
@@ -487,7 +428,6 @@ ax_phase.set_ylim(y_phase_lower, y_phase_upper)
 # ==============================================================================
 
 def format_frequency(freq_val: float) -> str:
-    """Formats frequency with adaptive SI unit prefixes."""
     if freq_val < 1e3:
         return f"{freq_val:.1f} Hz"
     if freq_val < 1e6:
@@ -496,8 +436,32 @@ def format_frequency(freq_val: float) -> str:
 
 
 def get_scaled_timebase(record: Dict[str, Any]) -> float:
-    """Scales numeric timebase according to the active unit multiplier."""
     return record["timebase_s"] * record["unit_multiplier"]
+
+
+def find_interpolated_zero_crossing(
+    t_arr: np.ndarray, y_arr: np.ndarray, target_t: float
+) -> Optional[float]:
+    """Finds the rising zero-crossing closest to target_t using sub-sample linear interpolation."""
+    cross_idx = np.where((y_arr[:-1] <= 0.0) & (y_arr[1:] > 0.0))[0]
+    if len(cross_idx) == 0:
+        return None
+
+    # Linear interpolation: t_zero = t0 + (0 - y0) * (t1 - t0) / (y1 - y0)
+    exact_times = []
+    for idx in cross_idx:
+        t0, t1 = t_arr[idx], t_arr[idx + 1]
+        y0, y1 = y_arr[idx], y_arr[idx + 1]
+        if y1 != y0:
+            t_interp = t0 - y0 * (t1 - t0) / (y1 - y0)
+            exact_times.append(t_interp)
+
+    if not exact_times:
+        return None
+
+    exact_times_arr = np.array(exact_times)
+    best_idx = np.argmin(np.abs(exact_times_arr - target_t))
+    return float(exact_times_arr[best_idx])
 
 
 title_handle = ax_oscilloscope.set_title(
@@ -521,55 +485,64 @@ slider_control = Slider(
 
 
 def on_slider_update(val: float) -> None:
-    """Synchronizes UI panes when inspecting individual sweep frequency points."""
     selected_idx = int(slider_control.val)
     record = sweep_records[selected_idx]
     current_freq = record["freq_hz"]
     current_phase = unwrapped_phase_array[selected_idx]
 
-    # 1. Update oscilloscope waveform plots
-    trace_ch1.set_data(record["time_axis_scaled"], record["ch1_waveform"])
-    trace_ch2.set_data(record["time_axis_scaled"], record["ch2_waveform"])
+    # 1. Update oscilloscope waveform traces
+    t_axis = record["time_axis_scaled"]
+    trace_ch1.set_data(t_axis, record["ch1_waveform"])
+    trace_ch2.set_data(t_axis, record["ch2_waveform"])
     ax_oscilloscope.set_xlim(0, record["total_time_scaled"])
     ax_oscilloscope.set_xlabel(f"Time [{record['time_unit']}]")
 
-    # 2. Precise phase-lag dimensioning (Anchored near screen center)
-    delta_t_seconds = abs(current_phase) / (360.0 * current_freq)
-    delta_t_scaled = delta_t_seconds * record["unit_multiplier"]
+    # 2. True zero-crossing measurement between CH1 and CH2
+    screen_center_t = record["total_time_scaled"] / 2.0
+    t_zero_ch1 = find_interpolated_zero_crossing(t_axis, record["ch1_waveform"], screen_center_t)
 
-    ch1_samples = record["ch1_waveform"]
-    zero_crossings = np.where((ch1_samples[:-1] <= 0) & (ch1_samples[1:] > 0))[0]
+    # Calculate physical expected zero crossing of CH2 based on phase
+    if t_zero_ch1 is not None:
+        period_scaled = (1.0 / current_freq) * record["unit_multiplier"]
+        # delta_t is positive if CH1 leads (lagging CH2 / lowpass), negative if CH2 leads (highpass)
+        ideal_shift_scaled = -(current_phase / 360.0) * period_scaled
+        target_ch2_search = t_zero_ch1 + ideal_shift_scaled
 
-    if len(zero_crossings) > 0:
-        screen_center_t = record["total_time_scaled"] / 2.0
-        crossing_times = record["time_axis_scaled"][zero_crossings]
-        best_crossing_idx = zero_crossings[np.argmin(np.abs(crossing_times - screen_center_t))]
+        t_zero_ch2 = find_interpolated_zero_crossing(t_axis, record["ch2_waveform"], target_ch2_search)
 
-        t_start = record["time_axis_scaled"][best_crossing_idx]
-        t_target = t_start + delta_t_scaled
+        if t_zero_ch2 is not None:
+            t_left = min(t_zero_ch1, t_zero_ch2)
+            t_right = max(t_zero_ch1, t_zero_ch2)
+            measured_delta_t = abs(t_zero_ch2 - t_zero_ch1)
 
-        line_marker_ch1.set_xdata([t_start, t_start])
-        line_marker_ch1.set_visible(True)
+            line_marker_ch1.set_xdata([t_zero_ch1, t_zero_ch1])
+            line_marker_ch1.set_visible(True)
 
-        line_marker_ch2.set_xdata([t_target, t_target])
-        line_marker_ch2.set_visible(True)
+            line_marker_ch2.set_xdata([t_zero_ch2, t_zero_ch2])
+            line_marker_ch2.set_visible(True)
 
-        arrow_delta_t.xy = (t_target, DIMENSION_ARROW_Y)
-        arrow_delta_t.set_position((t_start, DIMENSION_ARROW_Y))
-        arrow_delta_t.set_visible(True)
+            arrow_delta_t.xy = (t_right, DIMENSION_ARROW_Y)
+            arrow_delta_t.set_position((t_left, DIMENSION_ARROW_Y))
+            arrow_delta_t.set_visible(True)
 
-        label_arrow_delta_t.set_position(((t_start + t_target) / 2.0, DIMENSION_ARROW_Y + 0.05))
-        label_arrow_delta_t.set_visible(True)
+            label_arrow_delta_t.set_position(((t_left + t_right) / 2.0, DIMENSION_ARROW_Y + 0.05))
+            label_arrow_delta_t.set_visible(True)
 
-        text_phase_telemetry.set_text(
-            f"$\\Delta t$ = {delta_t_scaled:.2f} {record['time_unit']}  ($\\Delta \\varphi$ = {current_phase:.1f}°)"
-        )
+            text_phase_telemetry.set_text(
+                f"$\\Delta t$ = {measured_delta_t:.2f} {record['time_unit']}  ($\\Delta \\varphi$ = {current_phase:+.1f}°)"
+            )
+        else:
+            line_marker_ch1.set_visible(False)
+            line_marker_ch2.set_visible(False)
+            arrow_delta_t.set_visible(False)
+            label_arrow_delta_t.set_visible(False)
+            text_phase_telemetry.set_text(f"$\\Delta \\varphi$ = {current_phase:+.1f}°")
     else:
         line_marker_ch1.set_visible(False)
         line_marker_ch2.set_visible(False)
         arrow_delta_t.set_visible(False)
         label_arrow_delta_t.set_visible(False)
-        text_phase_telemetry.set_text(f"$\\Delta \\varphi$ = {current_phase:.1f}°")
+        text_phase_telemetry.set_text(f"$\\Delta \\varphi$ = {current_phase:+.1f}°")
 
     timebase_display = get_scaled_timebase(record)
     title_handle.set_text(
@@ -590,9 +563,7 @@ def on_slider_update(val: float) -> None:
     figure.canvas.draw_idle()
 
 
-# Initialize state for index 0
 on_slider_update(0)
-
 slider_control.on_changed(on_slider_update)
 
 plt.show()
