@@ -6,7 +6,7 @@
 
 An automated Frequency Response Analyzer (FRA) that turns a budget **Hantek DSO2D10** oscilloscope and its integrated DDS function generator into a full-featured Bode plotting testbench via USB/SCPI.
 
-![Dashboard Preview](docs/dashboard_preview.png)
+![Dashboard Preview](dashboard_preview.png)
 
 ---
 
