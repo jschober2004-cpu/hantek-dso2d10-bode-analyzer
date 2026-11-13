@@ -12,7 +12,9 @@ An automated Frequency Response Analyzer (FRA) that turns a budget **Hantek DSO2
 
 ## ⚡ Key Engineering Features
 
-* **High-Speed SCPI Automation:** Sweeps 100 logarithmic frequency steps (10 Hz – 25 MHz) by controlling the integrated DDS generator and adaptive oscilloscope timebases via `PyVISA-py`.
+* **High-Speed SCPI Automation:** Sweeps logarithmic frequency steps (default: 100 points, 10 Hz – 25 MHz) by controlling the integrated DDS generator and adaptive oscilloscope timebases via `PyVISA-py`.
+* **Configurable Sweep:** A start dialog sets the number of points, frequency range and stimulus amplitude, and shows an estimated sweep duration.
+* **Automatic Vertical Scale Detection:** The V/div of CH1/CH2 is read from the instrument (probe attenuation included), so any signal level works. Points where the signal hits the ADC limits are flagged as clipped.
 * **Coherent Hann-Windowed Single-Bin DFT:** Projects captured time-domain buffers onto continuous orthogonal carriers to extract precise magnitude and phase while completely eliminating spectral leakage without filter-type assumptions.
 * **Automated Cutoff Detection:** Accurately determines the $-3\,\text{dB}$ cutoff frequency ($f_c$) and passband phase angle using sub-bin logarithmic interpolation[cite: 7].
 * **Bidirectional Parasitic Crosstalk & Noise Classification:** Automatically identifies the filter topology (low-pass vs. high-pass) and classifies where circuit board parasitic coupling and ADC noise floor dominate, seamlessly transitioning the plot into a synchronized dashed red trajectory.
@@ -58,10 +60,14 @@ Check your device address via `pyvisa-info` and update `VISA_RESOURCE_ID` in `ha
 VISA_RESOURCE_ID = "USB0::1183::20574::CN5606029103430::0::INSTR"
 ```
 
-### 3. Run Sweep
+### 3. Set V/div on the Scope
+Adjust the vertical scale of CH1 and CH2 so that both signals fit on screen (8 divisions). The script reads these settings and does not change them.
+
+### 4. Run Sweep
 ```bash
 python hantek_bode_analyzer.py
 ```
+A dialog asks for the number of points, the frequency range (e.g. `10`, `1,5k`, `25M`) and the stimulus amplitude. The defaults (100 points, 10 Hz – 25 MHz, 2 Vpp) are sufficient for simple filters. Low frequencies dominate the sweep time, so starting at e.g. 100 Hz shortens the sweep noticeably.
 
 ---
 

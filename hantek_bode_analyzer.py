@@ -15,6 +15,8 @@ Key Enhancements:
 
 from __future__ import annotations
 
+import re
+import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -37,16 +39,188 @@ TIMEBASE_STEPS: Tuple[float, ...] = (
 )
 
 VISA_RESOURCE_ID: str = "USB0::1183::20574::CN5606029103430::0::INSTR"
-SWEEP_FREQ_START_HZ: float = 10.0
-SWEEP_FREQ_STOP_HZ: float = 25_000_000.0
-SWEEP_NUM_POINTS: int = 100
-DDS_STIMULUS_VPP: float = 2.0
-FIXED_VDIV_VOLTS: float = 0.5
+
+# Default sweep settings (pre-filled in the start dialog)
+DEFAULT_FREQ_START_HZ: float = 10.0
+DEFAULT_FREQ_STOP_HZ: float = 25_000_000.0
+DEFAULT_NUM_POINTS: int = 100
+DEFAULT_DDS_VPP: float = 2.0
+
+# Permitted ranges for the start dialog
+FREQ_MIN_HZ: float = 1.0
+FREQ_MAX_HZ: float = 25_000_000.0      # DDS upper limit of the DSO2D10
+NUM_POINTS_MIN: int = 2
+NUM_POINTS_MAX: int = 2000
+DDS_VPP_MIN: float = 0.1
+DDS_VPP_MAX: float = 7.0
+
+# ADC geometry: 8-bit samples, 25 counts per vertical division (8 div = 200 counts)
+ADC_COUNTS_PER_DIV: float = 25.0
+ADC_CLIP_MARGIN: int = 1               # samples within this many counts of 0/255 count as clipped
+ADC_CLIP_MIN_SAMPLES: int = 3          # tolerate single glitch samples
+
+# Empirical timing model for the duration estimate (approx. 2 min for 100 points)
+SWEEP_OVERHEAD_PER_POINT_S: float = 1.15
+
+# Oscilloscope plot: y-limit = factor * largest measured peak (1.72 -> +-1.6 V at 0.93 V peak)
+PLOT_Y_HEADROOM: float = 1.72
 
 
 def get_optimal_timebase(freq_hz: float) -> float:
     target_timebase = 3.5 / (14.0 * freq_hz)
     return min(TIMEBASE_STEPS, key=lambda tb: abs(tb - target_timebase))
+
+
+def get_settle_time(freq_hz: float) -> float:
+    return max(0.015, min(0.12, 2.5 / freq_hz))
+
+
+def format_frequency(freq_val: float) -> str:
+    if freq_val < 1e3:
+        return f"{freq_val:.1f} Hz"
+    if freq_val < 1e6:
+        return f"{freq_val/1e3:.2f} kHz"
+    return f"{freq_val/1e6:.2f} MHz"
+
+
+_SI_PREFIXES = {"": 1.0, "k": 1e3, "m": 1e6, "meg": 1e6}
+
+
+def parse_frequency(text: str) -> float:
+    """Parse '10', '1,5k', '25M', '2.5 MHz', '100 Hz' into Hz (case-insensitive prefixes)."""
+    cleaned = text.strip().replace(",", ".").replace(" ", "")
+    cleaned = re.sub(r"(?i)hz$", "", cleaned)
+    match = re.fullmatch(r"(?i)([0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?)(meg|k|m)?", cleaned)
+    if not match:
+        raise ValueError(f"Ungültige Frequenz: '{text}'")
+    return float(match.group(1)) * _SI_PREFIXES[(match.group(2) or "").lower()]
+
+
+def parse_number(text: str) -> float:
+    return float(text.strip().replace(",", "."))
+
+
+def estimate_sweep_duration(f_start: float, f_stop: float, num_points: int) -> float:
+    freqs = np.geomspace(f_start, f_stop, num_points)
+    return float(sum(
+        SWEEP_OVERHEAD_PER_POINT_S + get_settle_time(f) + 14.0 * get_optimal_timebase(f)
+        for f in freqs
+    ))
+
+
+def ask_sweep_settings() -> Optional[Tuple[float, float, int, float]]:
+    """Show the start dialog. Returns (f_start, f_stop, num_points, dds_vpp) or None if cancelled."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    result: Dict[str, Any] = {}
+
+    root = tk.Tk()
+    root.title("Bode-Analyzer – Sweep-Einstellungen")
+    root.resizable(False, False)
+
+    frame = ttk.Frame(root, padding=14)
+    frame.grid()
+
+    var_points = tk.StringVar(value=str(DEFAULT_NUM_POINTS))
+    var_start = tk.StringVar(value=format_frequency(DEFAULT_FREQ_START_HZ))
+    var_stop = tk.StringVar(value=format_frequency(DEFAULT_FREQ_STOP_HZ))
+    var_vpp = tk.StringVar(value=f"{DEFAULT_DDS_VPP:.1f}")
+    var_info = tk.StringVar()
+
+    rows = (
+        ("Messpunkte:", var_points, f"{NUM_POINTS_MIN} … {NUM_POINTS_MAX}"),
+        ("Startfrequenz:", var_start, f"ab {format_frequency(FREQ_MIN_HZ)}  (z. B. 10, 1,5k, 2M)"),
+        ("Stoppfrequenz:", var_stop, f"bis {format_frequency(FREQ_MAX_HZ)}"),
+        ("Generator-Amplitude [Vpp]:", var_vpp, f"{DDS_VPP_MIN} … {DDS_VPP_MAX}"),
+    )
+    entries = []
+    for row_idx, (label, var, hint) in enumerate(rows):
+        ttk.Label(frame, text=label).grid(row=row_idx, column=0, sticky="w", pady=3)
+        entry = ttk.Entry(frame, textvariable=var, width=14)
+        entry.grid(row=row_idx, column=1, padx=8, pady=3)
+        entries.append(entry)
+        ttk.Label(frame, text=hint, foreground="gray").grid(row=row_idx, column=2, sticky="w")
+
+    ttk.Label(
+        frame,
+        text="V/div wird vom Oszilloskop übernommen – bitte vorher so einstellen,\n"
+             "dass CH1 und CH2 nicht über den Bildschirm hinausgehen.",
+        foreground="gray",
+    ).grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 2))
+
+    info_label = ttk.Label(frame, textvariable=var_info)
+    info_label.grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(4, 8))
+
+    def validate() -> Optional[Tuple[float, float, int, float]]:
+        try:
+            points_f = parse_number(var_points.get())
+            if not points_f.is_integer():
+                raise ValueError("Messpunkte müssen eine ganze Zahl sein")
+            points = int(points_f)
+            f_start = parse_frequency(var_start.get())
+            f_stop = parse_frequency(var_stop.get())
+            vpp = parse_number(var_vpp.get())
+        except ValueError as exc:
+            var_info.set(f"⚠ {exc}")
+            info_label.configure(foreground="red")
+            return None
+
+        error = None
+        if not NUM_POINTS_MIN <= points <= NUM_POINTS_MAX:
+            error = f"Messpunkte müssen zwischen {NUM_POINTS_MIN} und {NUM_POINTS_MAX} liegen"
+        elif not FREQ_MIN_HZ <= f_start <= FREQ_MAX_HZ or not FREQ_MIN_HZ <= f_stop <= FREQ_MAX_HZ:
+            error = f"Frequenzen müssen zwischen {format_frequency(FREQ_MIN_HZ)} und {format_frequency(FREQ_MAX_HZ)} liegen"
+        elif f_start >= f_stop:
+            error = "Startfrequenz muss kleiner als Stoppfrequenz sein"
+        elif not DDS_VPP_MIN <= vpp <= DDS_VPP_MAX:
+            error = f"Amplitude muss zwischen {DDS_VPP_MIN} und {DDS_VPP_MAX} Vpp liegen"
+
+        if error:
+            var_info.set(f"⚠ {error}")
+            info_label.configure(foreground="red")
+            return None
+
+        duration = estimate_sweep_duration(f_start, f_stop, points)
+        minutes, seconds = divmod(int(round(duration)), 60)
+        var_info.set(f"Geschätzte Messdauer: ca. {minutes} min {seconds:02d} s")
+        info_label.configure(foreground="black")
+        return f_start, f_stop, points, vpp
+
+    def on_start(_event: Any = None) -> None:
+        settings = validate()
+        if settings is not None:
+            result["settings"] = settings
+            root.destroy()
+
+    def on_reset() -> None:
+        var_points.set(str(DEFAULT_NUM_POINTS))
+        var_start.set(format_frequency(DEFAULT_FREQ_START_HZ))
+        var_stop.set(format_frequency(DEFAULT_FREQ_STOP_HZ))
+        var_vpp.set(f"{DEFAULT_DDS_VPP:.1f}")
+
+    for var in (var_points, var_start, var_stop, var_vpp):
+        var.trace_add("write", lambda *_: validate())
+
+    buttons = ttk.Frame(frame)
+    buttons.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e")
+    ttk.Button(buttons, text="Standard", command=on_reset).grid(row=0, column=0, padx=4)
+    ttk.Button(buttons, text="Abbrechen", command=root.destroy).grid(row=0, column=1, padx=4)
+    ttk.Button(buttons, text="Messung starten", command=on_start).grid(row=0, column=2, padx=4)
+
+    root.bind("<Return>", on_start)
+    root.bind("<Escape>", lambda _e: root.destroy())
+    validate()
+    entries[0].focus_set()
+    root.mainloop()
+
+    return result.get("settings")
+
+
+def detect_clipping(raw_offset_binary: np.ndarray) -> bool:
+    """True if the waveform hits the ADC rails (signal exceeds the V/div range)."""
+    at_rail = (raw_offset_binary <= ADC_CLIP_MARGIN) | (raw_offset_binary >= 255 - ADC_CLIP_MARGIN)
+    return int(np.count_nonzero(at_rail)) >= ADC_CLIP_MIN_SAMPLES
 
 
 def fetch_waveform_raw(scope_inst: pyvisa.resources.MessageBasedResource) -> bytes:
@@ -112,6 +286,22 @@ def compute_spectral_point(
 
 
 # ==============================================================================
+# Sweep Configuration Dialog
+# ==============================================================================
+
+user_settings = ask_sweep_settings()
+if user_settings is None:
+    print("[ABORT] Sweep cancelled by user.")
+    sys.exit(0)
+
+SWEEP_FREQ_START_HZ, SWEEP_FREQ_STOP_HZ, SWEEP_NUM_POINTS, DDS_STIMULUS_VPP = user_settings
+print(
+    f"[CONFIG] {SWEEP_NUM_POINTS} points, {format_frequency(SWEEP_FREQ_START_HZ)} – "
+    f"{format_frequency(SWEEP_FREQ_STOP_HZ)}, stimulus {DDS_STIMULUS_VPP:.2f} Vpp"
+)
+
+
+# ==============================================================================
 # Hardware Initialization
 # ==============================================================================
 
@@ -125,15 +315,23 @@ scope.read_termination = "\n"
 device_identity = scope.query("*IDN?").strip()
 print(f"[HW-INIT] Connected to: {device_identity}")
 
-scope.write(f":DDS:TYPE SINE;:DDS:AMP {DDS_STIMULUS_VPP:.1f};:DDS:SWIT ON")
-scope.write(f":CHANnel1:SCALe {FIXED_VDIV_VOLTS:.2f}")
-scope.write(f":CHANnel2:SCALe {FIXED_VDIV_VOLTS:.2f}")
+scope.write(f":DDS:TYPE SINE;:DDS:AMP {DDS_STIMULUS_VPP:.3f};:DDS:SWIT ON")
 time.sleep(0.1)
 
+# Vertical scale is taken from the instrument as set by the user.
+# The returned V/div already includes the probe attenuation (1X/10X).
 vdiv_ch1 = float(scope.query(":CHANnel1:SCALe?").strip())
 vdiv_ch2 = float(scope.query(":CHANnel2:SCALe?").strip())
-scale_factor_ch1 = vdiv_ch1 / 25.0
-scale_factor_ch2 = vdiv_ch2 / 25.0
+scale_factor_ch1 = vdiv_ch1 / ADC_COUNTS_PER_DIV
+scale_factor_ch2 = vdiv_ch2 / ADC_COUNTS_PER_DIV
+print(f"[HW-INIT] Vertical scale read from scope: CH1 = {vdiv_ch1:g} V/div, CH2 = {vdiv_ch2:g} V/div")
+
+stimulus_screen_div = DDS_STIMULUS_VPP / vdiv_ch1
+if stimulus_screen_div > 8.0:
+    print(
+        f"[WARN] Stimulus {DDS_STIMULUS_VPP:.2f} Vpp spans {stimulus_screen_div:.1f} div on CH1 "
+        f"(screen = 8 div). Increase CH1 V/div to avoid clipping."
+    )
 
 sweep_frequencies = np.geomspace(SWEEP_FREQ_START_HZ, SWEEP_FREQ_STOP_HZ, SWEEP_NUM_POINTS)
 sweep_records: List[Dict[str, Any]] = []
@@ -142,6 +340,7 @@ raw_freqs: List[float] = []
 raw_mag_db: List[float] = []
 raw_phase_deg: List[float] = []
 raw_amps_ch2: List[float] = []
+clipping_events: List[Tuple[float, str]] = []
 
 
 # ==============================================================================
@@ -156,8 +355,7 @@ try:
         timebase_val = get_optimal_timebase(current_freq)
         scope.write(f":TIMebase:SCALe {timebase_val:.6e};:DDS:FREQ {current_freq:.2f}")
 
-        settle_time_s = max(0.015, min(0.12, 2.5 / current_freq))
-        time.sleep(settle_time_s)
+        time.sleep(get_settle_time(current_freq))
 
         raw_bytes = fetch_waveform_raw(scope)
         if len(raw_bytes) < 8000:
@@ -172,8 +370,18 @@ try:
         ch1_interleaved = np.concatenate([raw_buffer[0:block_len], raw_buffer[2*block_len:3*block_len]])
         ch2_interleaved = np.concatenate([raw_buffer[block_len:2*block_len], raw_buffer[3*block_len:4*block_len]])
 
-        ch1_centered = (ch1_interleaved ^ 0x80).astype(float)
-        ch2_centered = (ch2_interleaved ^ 0x80).astype(float)
+        ch1_offset_binary = ch1_interleaved ^ 0x80
+        ch2_offset_binary = ch2_interleaved ^ 0x80
+        clipped_ch1 = detect_clipping(ch1_offset_binary)
+        clipped_ch2 = detect_clipping(ch2_offset_binary)
+        if clipped_ch1 or clipped_ch2:
+            clipped_channels = " + ".join(
+                name for name, flag in (("CH1", clipped_ch1), ("CH2", clipped_ch2)) if flag
+            )
+            clipping_events.append((current_freq, clipped_channels))
+
+        ch1_centered = ch1_offset_binary.astype(float)
+        ch2_centered = ch2_offset_binary.astype(float)
 
         ch1_v = (ch1_centered - np.mean(ch1_centered)) * scale_factor_ch1
         ch2_v = (ch2_centered - np.mean(ch2_centered)) * scale_factor_ch2
@@ -220,6 +428,8 @@ try:
             "vpp_ch2": float(np.ptp(ch2_v)),
             "gain_db": gain,
             "phase_deg": phase,
+            "clipped_ch1": clipped_ch1,
+            "clipped_ch2": clipped_ch2,
         })
 
         freq_str = (
@@ -243,7 +453,12 @@ print(f"\n[SWEEP] Finished. {len(sweep_records)} points acquired in {elapsed_dur
 
 if not sweep_records:
     print("[FATAL] No measurement records captured. Halting.")
-    exit(1)
+    sys.exit(1)
+
+if clipping_events:
+    print(f"[WARN] Signal clipped (ADC limit) at {len(clipping_events)} point(s) – increase V/div on the scope:")
+    for clip_freq, clip_channels in clipping_events:
+        print(f"         {format_frequency(clip_freq):>11s}: {clip_channels}")
 
 
 # ==============================================================================
@@ -282,8 +497,10 @@ if len(crossing_indices) > 0:
         detected_cutoff_hz = 10.0**log_fc
 
 # --- Bidirectional Noise Floor / Parasitic Limit Detection ---
-# Identifies points dominated by ADC quantization floor or crosstalk (< -36 dB or < 18 mV)
-noise_floor_mask = (mag_db_array <= -36.0) | (amps2_array < 0.018)
+# Identifies points dominated by ADC quantization floor or crosstalk (< -36 dB or < ~0.9 LSB of CH2).
+# 0.9 LSB = 18 mV at 0.5 V/div; scales with the CH2 V/div read from the scope.
+noise_floor_amplitude_v = 0.9 * vdiv_ch2 / ADC_COUNTS_PER_DIV
+noise_floor_mask = (mag_db_array <= -36.0) | (amps2_array < noise_floor_amplitude_v)
 
 if is_highpass:
     # Stopband is at LOW frequencies (left side)
@@ -334,6 +551,13 @@ for axis in (ax_oscilloscope, ax_magnitude, ax_phase):
 
 initial_record = sweep_records[0]
 
+# Voltage axis scales with the largest measured peak (CH1 or CH2) across the sweep
+peak_voltage = max(
+    max(float(np.max(np.abs(rec["ch1_waveform"]))), float(np.max(np.abs(rec["ch2_waveform"]))))
+    for rec in sweep_records
+)
+osc_y_limit = PLOT_Y_HEADROOM * max(peak_voltage, 1e-3)
+
 # --- 1. Oscilloscope Time-Domain Axis ---
 ax_oscilloscope.axhline(0.0, color="black", linestyle="-", lw=1.0, alpha=0.7)
 
@@ -349,7 +573,8 @@ trace_ch2, = ax_oscilloscope.plot(
 line_marker_ch1 = ax_oscilloscope.axvline(0, color="tab:blue", linestyle="--", lw=1.3, alpha=0.85)
 line_marker_ch2 = ax_oscilloscope.axvline(0, color="tab:orange", linestyle="--", lw=1.3, alpha=0.85)
 
-DIMENSION_ARROW_Y: float = -1.25
+DIMENSION_ARROW_Y: float = -0.78 * osc_y_limit
+ARROW_LABEL_OFFSET: float = 0.03 * osc_y_limit
 arrow_delta_t = ax_oscilloscope.annotate(
     "",
     xy=(0, DIMENSION_ARROW_Y),
@@ -357,7 +582,7 @@ arrow_delta_t = ax_oscilloscope.annotate(
     arrowprops=dict(arrowstyle="<->", color="black", lw=1.4, shrinkA=0, shrinkB=0),
 )
 label_arrow_delta_t = ax_oscilloscope.text(
-    0, DIMENSION_ARROW_Y + 0.05, r"$\Delta t$",
+    0, DIMENSION_ARROW_Y + ARROW_LABEL_OFFSET, r"$\Delta t$",
     color="black", fontsize=10, ha="center", va="bottom", fontweight="bold"
 )
 
@@ -368,7 +593,7 @@ text_phase_telemetry = ax_oscilloscope.text(
 
 ax_oscilloscope.grid(True, linestyle="--", alpha=0.6)
 ax_oscilloscope.set_ylabel("Voltage [V]")
-ax_oscilloscope.set_ylim(-1.6, 1.6)
+ax_oscilloscope.set_ylim(-osc_y_limit, osc_y_limit)
 ax_oscilloscope.set_xlim(0, initial_record["total_time_scaled"])
 ax_oscilloscope.set_xlabel(f"Time [{initial_record['time_unit']}]")
 ax_oscilloscope.legend(loc="upper right")
@@ -427,16 +652,22 @@ ax_phase.set_ylim(min(-15.0, min_p - 15.0), max(15.0, max_p + 15.0))
 # Helper Formatting & Interaction Handlers
 # ==============================================================================
 
-def format_frequency(freq_val: float) -> str:
-    if freq_val < 1e3:
-        return f"{freq_val:.1f} Hz"
-    if freq_val < 1e6:
-        return f"{freq_val/1e3:.2f} kHz"
-    return f"{freq_val/1e6:.2f} MHz"
-
-
 def get_scaled_timebase(record: Dict[str, Any]) -> float:
     return record["timebase_s"] * record["unit_multiplier"]
+
+
+def build_oscilloscope_title(record: Dict[str, Any], gain_db: float) -> str:
+    title = (
+        f"Frequency: {format_frequency(record['freq_hz'])} | "
+        f"Timebase: {get_scaled_timebase(record):.1f} {record['time_unit']}/Div | "
+        f"{vdiv_ch1:g} / {vdiv_ch2:g} V/Div\n"
+        f"CH1: {record['vpp_ch1']:.2f} Vpp | CH2: {record['vpp_ch2']*1000:.1f} mVpp | "
+        f"Gain: {gain_db:.1f} dB"
+    )
+    clipped = [name for name, key in (("CH1", "clipped_ch1"), ("CH2", "clipped_ch2")) if record[key]]
+    if clipped:
+        title += f" | ⚠ {' + '.join(clipped)} übersteuert"
+    return title
 
 
 def find_interpolated_zero_crossing(
@@ -465,10 +696,7 @@ def find_interpolated_zero_crossing(
 
 
 title_handle = ax_oscilloscope.set_title(
-    f"Frequency: {format_frequency(initial_record['freq_hz'])} | "
-    f"Timebase: {get_scaled_timebase(initial_record):.1f} {initial_record['time_unit']}/Div\n"
-    f"CH1: {initial_record['vpp_ch1']:.2f} Vpp | CH2: {initial_record['vpp_ch2']*1000:.1f} mVpp | "
-    f"Gain: {mag_db_array[0]:.1f} dB",
+    build_oscilloscope_title(initial_record, mag_db_array[0]),
     fontsize=10,
 )
 
@@ -525,7 +753,7 @@ def on_slider_update(val: float) -> None:
             arrow_delta_t.set_position((t_left, DIMENSION_ARROW_Y))
             arrow_delta_t.set_visible(True)
 
-            label_arrow_delta_t.set_position(((t_left + t_right) / 2.0, DIMENSION_ARROW_Y + 0.05))
+            label_arrow_delta_t.set_position(((t_left + t_right) / 2.0, DIMENSION_ARROW_Y + ARROW_LABEL_OFFSET))
             label_arrow_delta_t.set_visible(True)
 
             text_phase_telemetry.set_text(
@@ -544,11 +772,8 @@ def on_slider_update(val: float) -> None:
         label_arrow_delta_t.set_visible(False)
         text_phase_telemetry.set_text(f"$\\Delta \\varphi$ = {current_phase:+.1f}°")
 
-    timebase_display = get_scaled_timebase(record)
-    title_handle.set_text(
-        f"Frequency: {format_frequency(current_freq)} | Timebase: {timebase_display:.1f} {record['time_unit']}/Div\n"
-        f"CH1: {record['vpp_ch1']:.2f} Vpp | CH2: {record['vpp_ch2']*1000:.1f} mVpp | Gain: {mag_db_array[selected_idx]:.1f} dB"
-    )
+    title_handle.set_text(build_oscilloscope_title(record, mag_db_array[selected_idx]))
+    title_handle.set_color("crimson" if (record["clipped_ch1"] or record["clipped_ch2"]) else "black")
     trace_ch1.set_label(f"CH1: {record['vpp_ch1']:.2f} Vpp")
     trace_ch2.set_label(f"CH2: {record['vpp_ch2']*1000:.1f} mVpp")
     ax_oscilloscope.legend(loc="upper right")
