@@ -1,16 +1,24 @@
 """Automated Frequency Response Analyzer (Bode Plotter) for Hantek DSO2D10.
 
 ========================================================================
-Key Enhancements:
-1. Universal Filter Topology Detection:
-   - Automatically classifies Low-Pass vs. High-Pass vs. Flat passbands.
-   - Accurately classifies parasitic noise boundaries on the appropriate side
-     (left for high-pass, right for low-pass).
-2. Sub-Sample Interpolated Zero-Crossing Dimensioning (Delta-t):
+Key Features:
+1. Sweep Settings Dialog:
+   - Number of points, frequency range, generator amplitude, Auto-V/div on/off,
+     estimated sweep duration.
+2. Auto-V/div (Auto-Ranging):
+   - CH1 set once for the stimulus, CH2 re-ranged per point (1-2-5 grid incl. probe
+     factor, read-back, stale first acquisition discarded). V/div stored per point;
+     original settings restored after the sweep. ADC clipping is flagged.
+3. Trend-Based Parasitic Detection (both sides):
+   - Passband anchor = highest flat region; stopbands followed outwards on both sides.
+   - Parasitic takeover detected by magnitude rise, phase reversal or ADC floor;
+     valid points must lie 10 dB above the extrapolated parasitic level.
+   - -3 dB cutoff evaluated within the reliable range only.
+4. Sub-Sample Interpolated Zero-Crossing Dimensioning (Delta-t):
    - Computes real rising zero-crossings for both CH1 and CH2 via linear interpolation.
    - Correctly anchors phase lead (Delta-t < 0 / CH2 ahead) and phase lag (Delta-t > 0).
-3. Dynamic Passband Axis Scaling:
-   - Symmetrically bounds the phase axis to prevent visual blowout from stopband noise.
+5. Dynamic Axis Scaling:
+   - Voltage axis follows the largest measured peak; phase axis follows the reliable range.
 """
 
 from __future__ import annotations
@@ -18,7 +26,7 @@ from __future__ import annotations
 import re
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
@@ -65,6 +73,47 @@ SWEEP_OVERHEAD_PER_POINT_S: float = 1.15
 # Oscilloscope plot: y-limit = factor * largest measured peak (1.72 -> +-1.6 V at 0.93 V peak)
 PLOT_Y_HEADROOM: float = 1.72
 
+# ------------------------------------------------------------------------------
+# Auto-V/div (auto-ranging)
+# ------------------------------------------------------------------------------
+DEFAULT_AUTO_VDIV: bool = True
+# Device range at 1X probe: 2 mV/div ... 10 V/div (verified at 10X: 20 mV ... 100 V).
+# The scope silently ignores values outside the range or off the 1-2-5 grid.
+VDIV_MIN_AT_1X: float = 2e-3
+VDIV_MAX_AT_1X: float = 10.0
+CH1_TARGET_MAX_DIV: float = 6.0        # stimulus may span at most ~6 div on CH1
+AUTORANGE_UPPER_COUNTS: int = 175      # > 7 div peak-peak -> one step coarser
+AUTORANGE_LOWER_COUNTS: int = 60       # < 2.4 div peak-peak -> one step finer
+AUTORANGE_MAX_SWITCHES: int = 4        # per measurement point
+# Verified on the DSO2D10: the first acquisition after :CHANnel<n>:SCALe may still
+# contain (partly) old-scale data, even after 200 ms. The second one is always valid.
+# So after every switch: short wait, discard one acquisition, then measure.
+AUTORANGE_POST_SWITCH_MIN_WAIT_S: float = 0.05
+AUTORANGE_POST_SWITCH_MAX_WAIT_S: float = 0.6
+# Duration estimate surcharge: typical number of range switches x cost per switch
+# (set + read-back ~0.7 s, discarded acquisition, re-measurement)
+AUTORANGE_ESTIMATE_SWITCHES: int = 8
+AUTORANGE_ESTIMATE_COST_PER_SWITCH_S: float = 2.0
+
+
+def build_vdiv_steps(probe_factor: float) -> List[float]:
+    """1-2-5 V/div steps within the device range, including the probe factor."""
+    steps = []
+    for exponent in range(-4, 4):
+        for mantissa in (1.0, 2.0, 5.0):
+            value = float(f"{mantissa * 10.0**exponent * probe_factor:.6g}")
+            if VDIV_MIN_AT_1X * probe_factor * 0.999 <= value <= VDIV_MAX_AT_1X * probe_factor * 1.001:
+                steps.append(value)
+    return steps
+
+
+def nearest_step_index(steps: List[float], vdiv: float) -> int:
+    return int(np.argmin([abs(np.log(step / vdiv)) for step in steps]))
+
+
+def format_vdiv(vdiv: float) -> str:
+    return f"{vdiv*1000:g} mV" if vdiv < 1.0 else f"{vdiv:g} V"
+
 
 def get_optimal_timebase(freq_hz: float) -> float:
     target_timebase = 3.5 / (14.0 * freq_hz)
@@ -92,7 +141,7 @@ def parse_frequency(text: str) -> float:
     cleaned = re.sub(r"(?i)hz$", "", cleaned)
     match = re.fullmatch(r"(?i)([0-9]*\.?[0-9]+(?:e[+-]?[0-9]+)?)(meg|k|m)?", cleaned)
     if not match:
-        raise ValueError(f"Ungültige Frequenz: '{text}'")
+        raise ValueError(f"Invalid frequency: '{text}'")
     return float(match.group(1)) * _SI_PREFIXES[(match.group(2) or "").lower()]
 
 
@@ -100,23 +149,26 @@ def parse_number(text: str) -> float:
     return float(text.strip().replace(",", "."))
 
 
-def estimate_sweep_duration(f_start: float, f_stop: float, num_points: int) -> float:
+def estimate_sweep_duration(f_start: float, f_stop: float, num_points: int, auto_vdiv: bool = False) -> float:
     freqs = np.geomspace(f_start, f_stop, num_points)
-    return float(sum(
+    duration = float(sum(
         SWEEP_OVERHEAD_PER_POINT_S + get_settle_time(f) + 14.0 * get_optimal_timebase(f)
         for f in freqs
     ))
+    if auto_vdiv:
+        duration += AUTORANGE_ESTIMATE_SWITCHES * AUTORANGE_ESTIMATE_COST_PER_SWITCH_S
+    return duration
 
 
-def ask_sweep_settings() -> Optional[Tuple[float, float, int, float]]:
-    """Show the start dialog. Returns (f_start, f_stop, num_points, dds_vpp) or None if cancelled."""
+def ask_sweep_settings() -> Optional[Tuple[float, float, int, float, bool]]:
+    """Show the start dialog. Returns (f_start, f_stop, num_points, dds_vpp, auto_vdiv) or None if cancelled."""
     import tkinter as tk
     from tkinter import ttk
 
     result: Dict[str, Any] = {}
 
     root = tk.Tk()
-    root.title("Bode-Analyzer – Sweep-Einstellungen")
+    root.title("Bode Analyzer – Sweep Settings")
     root.resizable(False, False)
 
     frame = ttk.Frame(root, padding=14)
@@ -127,12 +179,14 @@ def ask_sweep_settings() -> Optional[Tuple[float, float, int, float]]:
     var_stop = tk.StringVar(value=format_frequency(DEFAULT_FREQ_STOP_HZ))
     var_vpp = tk.StringVar(value=f"{DEFAULT_DDS_VPP:.1f}")
     var_info = tk.StringVar()
+    var_auto = tk.BooleanVar(value=DEFAULT_AUTO_VDIV)
+    var_vdiv_hint = tk.StringVar()
 
     rows = (
-        ("Messpunkte:", var_points, f"{NUM_POINTS_MIN} … {NUM_POINTS_MAX}"),
-        ("Startfrequenz:", var_start, f"ab {format_frequency(FREQ_MIN_HZ)}  (z. B. 10, 1,5k, 2M)"),
-        ("Stoppfrequenz:", var_stop, f"bis {format_frequency(FREQ_MAX_HZ)}"),
-        ("Generator-Amplitude [Vpp]:", var_vpp, f"{DDS_VPP_MIN} … {DDS_VPP_MAX}"),
+        ("Measurement points:", var_points, f"{NUM_POINTS_MIN} … {NUM_POINTS_MAX}"),
+        ("Start frequency:", var_start, f"from {format_frequency(FREQ_MIN_HZ)}  (e.g. 10, 1.5k, 2M)"),
+        ("Stop frequency:", var_stop, f"up to {format_frequency(FREQ_MAX_HZ)}"),
+        ("Generator amplitude [Vpp]:", var_vpp, f"{DDS_VPP_MIN} … {DDS_VPP_MAX}"),
     )
     entries = []
     for row_idx, (label, var, hint) in enumerate(rows):
@@ -142,21 +196,30 @@ def ask_sweep_settings() -> Optional[Tuple[float, float, int, float]]:
         entries.append(entry)
         ttk.Label(frame, text=hint, foreground="gray").grid(row=row_idx, column=2, sticky="w")
 
-    ttk.Label(
-        frame,
-        text="V/div wird vom Oszilloskop übernommen – bitte vorher so einstellen,\n"
-             "dass CH1 und CH2 nicht über den Bildschirm hinausgehen.",
-        foreground="gray",
-    ).grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 2))
+    ttk.Checkbutton(
+        frame, text="Auto-V/div (adjust vertical scale automatically)", variable=var_auto,
+    ).grid(row=len(rows), column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    ttk.Label(frame, textvariable=var_vdiv_hint, foreground="gray").grid(
+        row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(2, 2)
+    )
 
     info_label = ttk.Label(frame, textvariable=var_info)
-    info_label.grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(4, 8))
+    info_label.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="w", pady=(4, 8))
 
-    def validate() -> Optional[Tuple[float, float, int, float]]:
+    def validate() -> Optional[Tuple[float, float, int, float, bool]]:
+        auto_vdiv = bool(var_auto.get())
+        var_vdiv_hint.set(
+            "CH1 is set once, CH2 is re-ranged at every measurement point.\n"
+            "The original V/div settings are restored afterwards."
+            if auto_vdiv else
+            "V/div is taken from the oscilloscope – set it beforehand so that\n"
+            "CH1 and CH2 stay within the screen."
+        )
         try:
             points_f = parse_number(var_points.get())
             if not points_f.is_integer():
-                raise ValueError("Messpunkte müssen eine ganze Zahl sein")
+                raise ValueError("Measurement points must be an integer")
             points = int(points_f)
             f_start = parse_frequency(var_start.get())
             f_stop = parse_frequency(var_stop.get())
@@ -168,24 +231,24 @@ def ask_sweep_settings() -> Optional[Tuple[float, float, int, float]]:
 
         error = None
         if not NUM_POINTS_MIN <= points <= NUM_POINTS_MAX:
-            error = f"Messpunkte müssen zwischen {NUM_POINTS_MIN} und {NUM_POINTS_MAX} liegen"
+            error = f"Measurement points must be between {NUM_POINTS_MIN} and {NUM_POINTS_MAX}"
         elif not FREQ_MIN_HZ <= f_start <= FREQ_MAX_HZ or not FREQ_MIN_HZ <= f_stop <= FREQ_MAX_HZ:
-            error = f"Frequenzen müssen zwischen {format_frequency(FREQ_MIN_HZ)} und {format_frequency(FREQ_MAX_HZ)} liegen"
+            error = f"Frequencies must be between {format_frequency(FREQ_MIN_HZ)} and {format_frequency(FREQ_MAX_HZ)}"
         elif f_start >= f_stop:
-            error = "Startfrequenz muss kleiner als Stoppfrequenz sein"
+            error = "Start frequency must be lower than stop frequency"
         elif not DDS_VPP_MIN <= vpp <= DDS_VPP_MAX:
-            error = f"Amplitude muss zwischen {DDS_VPP_MIN} und {DDS_VPP_MAX} Vpp liegen"
+            error = f"Amplitude must be between {DDS_VPP_MIN} and {DDS_VPP_MAX} Vpp"
 
         if error:
             var_info.set(f"⚠ {error}")
             info_label.configure(foreground="red")
             return None
 
-        duration = estimate_sweep_duration(f_start, f_stop, points)
+        duration = estimate_sweep_duration(f_start, f_stop, points, auto_vdiv)
         minutes, seconds = divmod(int(round(duration)), 60)
-        var_info.set(f"Geschätzte Messdauer: ca. {minutes} min {seconds:02d} s")
+        var_info.set(f"Estimated sweep duration: approx. {minutes} min {seconds:02d} s")
         info_label.configure(foreground="black")
-        return f_start, f_stop, points, vpp
+        return f_start, f_stop, points, vpp, auto_vdiv
 
     def on_start(_event: Any = None) -> None:
         settings = validate()
@@ -198,15 +261,16 @@ def ask_sweep_settings() -> Optional[Tuple[float, float, int, float]]:
         var_start.set(format_frequency(DEFAULT_FREQ_START_HZ))
         var_stop.set(format_frequency(DEFAULT_FREQ_STOP_HZ))
         var_vpp.set(f"{DEFAULT_DDS_VPP:.1f}")
+        var_auto.set(DEFAULT_AUTO_VDIV)
 
-    for var in (var_points, var_start, var_stop, var_vpp):
+    for var in (var_points, var_start, var_stop, var_vpp, var_auto):
         var.trace_add("write", lambda *_: validate())
 
     buttons = ttk.Frame(frame)
-    buttons.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="e")
-    ttk.Button(buttons, text="Standard", command=on_reset).grid(row=0, column=0, padx=4)
-    ttk.Button(buttons, text="Abbrechen", command=root.destroy).grid(row=0, column=1, padx=4)
-    ttk.Button(buttons, text="Messung starten", command=on_start).grid(row=0, column=2, padx=4)
+    buttons.grid(row=len(rows) + 3, column=0, columnspan=3, sticky="e")
+    ttk.Button(buttons, text="Defaults", command=on_reset).grid(row=0, column=0, padx=4)
+    ttk.Button(buttons, text="Cancel", command=root.destroy).grid(row=0, column=1, padx=4)
+    ttk.Button(buttons, text="Start sweep", command=on_start).grid(row=0, column=2, padx=4)
 
     root.bind("<Return>", on_start)
     root.bind("<Escape>", lambda _e: root.destroy())
@@ -257,6 +321,56 @@ def fetch_waveform_raw(scope_inst: pyvisa.resources.MessageBasedResource) -> byt
     return b""
 
 
+RAW_BLOCK_LEN: int = 2000
+RAW_MIN_BYTES: int = 4 * RAW_BLOCK_LEN
+
+
+def split_channels(raw_bytes: bytes) -> Tuple[np.ndarray, np.ndarray]:
+    """De-interleave the raw buffer into CH1/CH2 offset-binary samples (0..255)."""
+    raw_buffer = np.frombuffer(raw_bytes, dtype=np.uint8)
+    blk = RAW_BLOCK_LEN
+    ch1 = np.concatenate([raw_buffer[0:blk], raw_buffer[2*blk:3*blk]]) ^ 0x80
+    ch2 = np.concatenate([raw_buffer[blk:2*blk], raw_buffer[3*blk:4*blk]]) ^ 0x80
+    return ch1, ch2
+
+
+def acquire_channels(
+    scope_inst: pyvisa.resources.MessageBasedResource, discard_first: bool = False
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Fetch one acquisition. With discard_first, one acquisition is thrown away first
+    (needed after a V/div switch, see AUTORANGE_POST_SWITCH_* notes)."""
+    if discard_first:
+        fetch_waveform_raw(scope_inst)
+    raw_bytes = fetch_waveform_raw(scope_inst)
+    if len(raw_bytes) < RAW_MIN_BYTES:
+        time.sleep(0.02)
+        raw_bytes = fetch_waveform_raw(scope_inst)
+        if len(raw_bytes) < RAW_MIN_BYTES:
+            return None
+    return split_channels(raw_bytes)
+
+
+def set_vdiv(scope_inst: pyvisa.resources.MessageBasedResource, channel: int, vdiv: float) -> float:
+    """Set V/div and return the value actually applied by the scope (read back)."""
+    scope_inst.write(f":CHANnel{channel}:SCALe {vdiv:g}")
+    return float(scope_inst.query(f":CHANnel{channel}:SCALe?").strip())
+
+
+def wait_after_vdiv_switch(timebase_s: float) -> None:
+    time.sleep(float(np.clip(2.0 * 14.0 * timebase_s,
+                             AUTORANGE_POST_SWITCH_MIN_WAIT_S, AUTORANGE_POST_SWITCH_MAX_WAIT_S)))
+
+
+def autorange_direction(samples_offset_binary: np.ndarray) -> int:
+    """+1 = one step coarser, -1 = one step finer, 0 = range is fine."""
+    peak_to_peak_counts = int(np.ptp(samples_offset_binary))
+    if detect_clipping(samples_offset_binary) or peak_to_peak_counts > AUTORANGE_UPPER_COUNTS:
+        return +1
+    if peak_to_peak_counts < AUTORANGE_LOWER_COUNTS:
+        return -1
+    return 0
+
+
 def compute_spectral_point(
     ch1_voltage: np.ndarray,
     ch2_voltage: np.ndarray,
@@ -294,10 +408,11 @@ if user_settings is None:
     print("[ABORT] Sweep cancelled by user.")
     sys.exit(0)
 
-SWEEP_FREQ_START_HZ, SWEEP_FREQ_STOP_HZ, SWEEP_NUM_POINTS, DDS_STIMULUS_VPP = user_settings
+SWEEP_FREQ_START_HZ, SWEEP_FREQ_STOP_HZ, SWEEP_NUM_POINTS, DDS_STIMULUS_VPP, AUTO_VDIV = user_settings
 print(
     f"[CONFIG] {SWEEP_NUM_POINTS} points, {format_frequency(SWEEP_FREQ_START_HZ)} – "
-    f"{format_frequency(SWEEP_FREQ_STOP_HZ)}, stimulus {DDS_STIMULUS_VPP:.2f} Vpp"
+    f"{format_frequency(SWEEP_FREQ_STOP_HZ)}, stimulus {DDS_STIMULUS_VPP:.2f} Vpp, "
+    f"Auto-V/div {'ON' if AUTO_VDIV else 'OFF'}"
 )
 
 
@@ -318,20 +433,98 @@ print(f"[HW-INIT] Connected to: {device_identity}")
 scope.write(f":DDS:TYPE SINE;:DDS:AMP {DDS_STIMULUS_VPP:.3f};:DDS:SWIT ON")
 time.sleep(0.1)
 
-# Vertical scale is taken from the instrument as set by the user.
-# The returned V/div already includes the probe attenuation (1X/10X).
-vdiv_ch1 = float(scope.query(":CHANnel1:SCALe?").strip())
-vdiv_ch2 = float(scope.query(":CHANnel2:SCALe?").strip())
-scale_factor_ch1 = vdiv_ch1 / ADC_COUNTS_PER_DIV
-scale_factor_ch2 = vdiv_ch2 / ADC_COUNTS_PER_DIV
-print(f"[HW-INIT] Vertical scale read from scope: CH1 = {vdiv_ch1:g} V/div, CH2 = {vdiv_ch2:g} V/div")
+# Vertical scale as set by the user. The returned V/div already includes the
+# probe attenuation (1X/10X). These values are restored after an auto-ranged sweep.
+original_vdiv_ch1 = float(scope.query(":CHANnel1:SCALe?").strip())
+original_vdiv_ch2 = float(scope.query(":CHANnel2:SCALe?").strip())
+vdiv_ch1 = original_vdiv_ch1
+vdiv_ch2 = original_vdiv_ch2
+print(f"[HW-INIT] Vertical scale read from scope: CH1 = {format_vdiv(vdiv_ch1)}/div, CH2 = {format_vdiv(vdiv_ch2)}/div")
 
-stimulus_screen_div = DDS_STIMULUS_VPP / vdiv_ch1
-if stimulus_screen_div > 8.0:
+vdiv_steps_ch1: List[float] = []
+vdiv_steps_ch2: List[float] = []
+if AUTO_VDIV:
+    probe_ch1 = float(scope.query(":CHANnel1:PROBe?").strip())
+    probe_ch2 = float(scope.query(":CHANnel2:PROBe?").strip())
+    vdiv_steps_ch1 = build_vdiv_steps(probe_ch1)
+    vdiv_steps_ch2 = build_vdiv_steps(probe_ch2)
     print(
-        f"[WARN] Stimulus {DDS_STIMULUS_VPP:.2f} Vpp spans {stimulus_screen_div:.1f} div on CH1 "
-        f"(screen = 8 div). Increase CH1 V/div to avoid clipping."
+        f"[AUTO-VDIV] Probe CH1 {probe_ch1:g}X, CH2 {probe_ch2:g}X | CH2 range "
+        f"{format_vdiv(vdiv_steps_ch2[0])} … {format_vdiv(vdiv_steps_ch2[-1])}/div"
     )
+else:
+    stimulus_screen_div = DDS_STIMULUS_VPP / vdiv_ch1
+    if stimulus_screen_div > 8.0:
+        print(
+            f"[WARN] Stimulus {DDS_STIMULUS_VPP:.2f} Vpp spans {stimulus_screen_div:.1f} div on CH1 "
+            f"(screen = 8 div). Increase CH1 V/div to avoid clipping."
+        )
+
+
+def setup_ch1_autorange() -> None:
+    """Pick the finest CH1 step where the stimulus spans at most CH1_TARGET_MAX_DIV,
+    then verify with a test acquisition (coarser if it still clips / exceeds 7 div)."""
+    global vdiv_ch1
+    target_vdiv = DDS_STIMULUS_VPP / CH1_TARGET_MAX_DIV
+    candidates = [step for step in vdiv_steps_ch1 if step >= target_vdiv * 0.999]
+    vdiv_ch1 = set_vdiv(scope, 1, candidates[0] if candidates else vdiv_steps_ch1[-1])
+
+    test_freq = SWEEP_FREQ_START_HZ
+    test_timebase = get_optimal_timebase(test_freq)
+    scope.write(f":TIMebase:SCALe {test_timebase:.6e};:DDS:FREQ {test_freq:.2f}")
+    time.sleep(get_settle_time(test_freq))
+    wait_after_vdiv_switch(test_timebase)
+
+    for _ in range(AUTORANGE_MAX_SWITCHES + 1):
+        acquisition = acquire_channels(scope, discard_first=True)
+        if acquisition is None:
+            print("[AUTO-VDIV] CH1 test acquisition failed – keeping the calculated V/div.")
+            return
+        ch1_samples, _ = acquisition
+        ptp_counts = int(np.ptp(ch1_samples))
+        print(
+            f"[AUTO-VDIV] CH1 = {format_vdiv(vdiv_ch1)}/div: test measurement "
+            f"{ptp_counts * vdiv_ch1 / ADC_COUNTS_PER_DIV:.2f} Vpp ({ptp_counts / ADC_COUNTS_PER_DIV:.1f} div)"
+        )
+        if autorange_direction(ch1_samples) <= 0:
+            return
+        next_idx = nearest_step_index(vdiv_steps_ch1, vdiv_ch1) + 1
+        if next_idx >= len(vdiv_steps_ch1):
+            print("[AUTO-VDIV] CH1 largest V/div reached – signal may clip.")
+            return
+        vdiv_ch1 = set_vdiv(scope, 1, vdiv_steps_ch1[next_idx])
+        wait_after_vdiv_switch(test_timebase)
+
+
+def autorange_ch2(
+    acquisition: Tuple[np.ndarray, np.ndarray], timebase_s: float
+) -> Tuple[Optional[Tuple[np.ndarray, np.ndarray]], int]:
+    """Adjust CH2 V/div step by step until the signal spans ~2.4 … 7 div.
+    Returns the acquisition taken with the final V/div and the number of switches."""
+    global vdiv_ch2
+    switches = 0
+    last_direction = 0
+    while switches < AUTORANGE_MAX_SWITCHES:
+        direction = autorange_direction(acquisition[1])
+        # Stop if in range, or if the direction reverses (hysteresis / no ping-pong)
+        if direction == 0 or (last_direction != 0 and direction != last_direction):
+            break
+        next_idx = nearest_step_index(vdiv_steps_ch2, vdiv_ch2) + direction
+        if not 0 <= next_idx < len(vdiv_steps_ch2):
+            break
+        applied = set_vdiv(scope, 2, vdiv_steps_ch2[next_idx])
+        if abs(applied - vdiv_ch2) <= 1e-9 * max(applied, vdiv_ch2):
+            break  # scope refused the step (range limit)
+        vdiv_ch2 = applied
+        switches += 1
+        last_direction = direction
+        wait_after_vdiv_switch(timebase_s)
+        new_acquisition = acquire_channels(scope, discard_first=True)
+        if new_acquisition is None:
+            return None, switches
+        acquisition = new_acquisition
+    return acquisition, switches
+
 
 sweep_frequencies = np.geomspace(SWEEP_FREQ_START_HZ, SWEEP_FREQ_STOP_HZ, SWEEP_NUM_POINTS)
 sweep_records: List[Dict[str, Any]] = []
@@ -340,38 +533,47 @@ raw_freqs: List[float] = []
 raw_mag_db: List[float] = []
 raw_phase_deg: List[float] = []
 raw_amps_ch2: List[float] = []
+raw_vdiv_ch2: List[float] = []
 clipping_events: List[Tuple[float, str]] = []
+total_vdiv_switches = 0
 
 
 # ==============================================================================
 # Frequency Sweep Acquisition Loop
 # ==============================================================================
 
-print(f"\n[SWEEP] Commencing automated sweep ({SWEEP_NUM_POINTS} points)...")
 sweep_start_timestamp = time.time()
 
 try:
+    if AUTO_VDIV:
+        setup_ch1_autorange()
+        # CH2 starts at the CH1 range (passband gain ~0 dB is the common case);
+        # afterwards every point starts with the V/div of the previous point.
+        vdiv_ch2 = set_vdiv(scope, 2, vdiv_steps_ch2[nearest_step_index(vdiv_steps_ch2, vdiv_ch1)])
+
+    print(f"\n[SWEEP] Commencing automated sweep ({SWEEP_NUM_POINTS} points)...")
+
     for point_idx, current_freq in enumerate(sweep_frequencies):
         timebase_val = get_optimal_timebase(current_freq)
         scope.write(f":TIMebase:SCALe {timebase_val:.6e};:DDS:FREQ {current_freq:.2f}")
 
         time.sleep(get_settle_time(current_freq))
 
-        raw_bytes = fetch_waveform_raw(scope)
-        if len(raw_bytes) < 8000:
-            time.sleep(0.02)
-            raw_bytes = fetch_waveform_raw(scope)
-            if len(raw_bytes) < 8000:
+        # The initial CH2 switch above needs the same stale-data handling as any other switch
+        acquisition = acquire_channels(scope, discard_first=(AUTO_VDIV and point_idx == 0))
+        if acquisition is None:
+            continue
+
+        if AUTO_VDIV:
+            acquisition, point_switches = autorange_ch2(acquisition, timebase_val)
+            total_vdiv_switches += point_switches
+            if acquisition is None:
                 continue
 
-        raw_buffer = np.frombuffer(raw_bytes, dtype=np.uint8)
-        block_len = 2000
+        ch1_offset_binary, ch2_offset_binary = acquisition
+        scale_factor_ch1 = vdiv_ch1 / ADC_COUNTS_PER_DIV
+        scale_factor_ch2 = vdiv_ch2 / ADC_COUNTS_PER_DIV
 
-        ch1_interleaved = np.concatenate([raw_buffer[0:block_len], raw_buffer[2*block_len:3*block_len]])
-        ch2_interleaved = np.concatenate([raw_buffer[block_len:2*block_len], raw_buffer[3*block_len:4*block_len]])
-
-        ch1_offset_binary = ch1_interleaved ^ 0x80
-        ch2_offset_binary = ch2_interleaved ^ 0x80
         clipped_ch1 = detect_clipping(ch1_offset_binary)
         clipped_ch2 = detect_clipping(ch2_offset_binary)
         if clipped_ch1 or clipped_ch2:
@@ -400,6 +602,7 @@ try:
         raw_mag_db.append(gain)
         raw_phase_deg.append(phase)
         raw_amps_ch2.append(amp_ch2)
+        raw_vdiv_ch2.append(vdiv_ch2)
 
         ch1_onscreen = ch1_v[:zoom_limit]
         ch2_onscreen = ch2_v[:zoom_limit]
@@ -430,6 +633,8 @@ try:
             "phase_deg": phase,
             "clipped_ch1": clipped_ch1,
             "clipped_ch2": clipped_ch2,
+            "vdiv_ch1": vdiv_ch1,
+            "vdiv_ch2": vdiv_ch2,
         })
 
         freq_str = (
@@ -437,11 +642,25 @@ try:
                 f"{current_freq/1e3:6.2f} kHz" if current_freq < 1e6 else f"{current_freq/1e6:6.2f} MHz"
             )
         )
-        print(f"[{point_idx+1:3d}/{len(sweep_frequencies)}] f = {freq_str:>10s} | Gain = {gain:6.1f} dB", end="\r")
+        print(
+            f"[{point_idx+1:3d}/{len(sweep_frequencies)}] f = {freq_str:>10s} | Gain = {gain:6.1f} dB"
+            f" | CH2 {format_vdiv(vdiv_ch2):>7s}/div   ",
+            end="\r",
+        )
 
 except Exception as err:
     print(f"\n[ERROR] Acquisition fault: {err}")
 finally:
+    if AUTO_VDIV:
+        try:
+            scope.write(f":CHANnel1:SCALe {original_vdiv_ch1:g}")
+            scope.write(f":CHANnel2:SCALe {original_vdiv_ch2:g}")
+            print(
+                f"\n[AUTO-VDIV] {total_vdiv_switches} CH2 range switches. Restored V/div: "
+                f"CH1 {format_vdiv(original_vdiv_ch1)}/div, CH2 {format_vdiv(original_vdiv_ch2)}/div"
+            )
+        except Exception as restore_err:
+            print(f"\n[WARN] Could not restore original V/div settings: {restore_err}")
     try:
         scope.write(":KEY:LOCK DISABLE")
     except Exception:
@@ -456,7 +675,11 @@ if not sweep_records:
     sys.exit(1)
 
 if clipping_events:
-    print(f"[WARN] Signal clipped (ADC limit) at {len(clipping_events)} point(s) – increase V/div on the scope:")
+    clip_hint = (
+        "auto-ranging could not avoid it (range limit or too many switches)"
+        if AUTO_VDIV else "increase V/div on the scope"
+    )
+    print(f"[WARN] Signal clipped (ADC limit) at {len(clipping_events)} point(s) – {clip_hint}:")
     for clip_freq, clip_channels in clipping_events:
         print(f"         {format_frequency(clip_freq):>11s}: {clip_channels}")
 
@@ -471,23 +694,173 @@ phase_deg_array = np.array(raw_phase_deg)
 amps2_array = np.array(raw_amps_ch2)
 unwrapped_phase_array = np.rad2deg(np.unwrap(np.deg2rad(phase_deg_array)))
 
-# Determine filter character (Low-Pass vs. High-Pass)
-# Low-pass has high gain at start and low at end; High-pass is vice-versa
-start_gain_median = float(np.median(mag_db_array[:5]))
-end_gain_median = float(np.median(mag_db_array[-5:]))
+# --- Bidirectional Parasitic Limit Detection (trend-based) ---
+# 1. Passband anchor: the highest point that is also FLAT. A parasitic rise can reach
+#    passband level at the band edge (e.g. +0.5 dB at 25 MHz behind a 1st-order RC),
+#    but it is steep there, while a real passband (or resonance peak) has slope ~0.
+# 2. From the anchor the curve is followed outwards to BOTH sides (low-pass: right,
+#    high-pass: left, band-pass: both). Within the stopband, parasitic coupling
+#    (ground inductance, crosstalk, ESL) is detected where
+#      - the magnitude rises again by more than PARASITIC_MAG_RISE_DB above its minimum,
+#      - the phase reverses its trend by more than PARASITIC_PHASE_REVERSAL_DEG, or
+#      - CH2 drops below the ADC resolution (per-point V/div).
+# 3. The dip (partial cancellation of filter and parasitic path) marks the takeover.
+#    The parasitic level is extrapolated from the trend of the curve beyond the dip back
+#    towards the passband. Points are valid if they lie at least PARASITIC_MARGIN_DB
+#    above it (10 dB -> max. error approx. +-3 dB / +-18 deg).
+PASSBAND_CANDIDATE_DB: float = 6.0             # anchor candidates: within 6 dB of the maximum
+PARASITIC_STOPBAND_GATE_DB: float = 10.0       # checks only active this far below the passband
+PARASITIC_MAG_RISE_DB: float = 3.0
+PARASITIC_PHASE_REVERSAL_DEG: float = 10.0
+PARASITIC_PHASE_TREND_MIN_DEG: float = 10.0    # minimum phase travel to establish a trend
+PARASITIC_MIN_AMPLITUDE_LSB: float = 0.9       # 0.9 LSB = 18 mV at 0.5 V/div
+PARASITIC_LEVEL_WINDOW_DEC: float = 0.5        # parasitic trend is fitted over 0.5 decade …
+PARASITIC_FIT_START_DEC: float = 0.2           # … starting 0.2 decade beyond the dip
+PARASITIC_MAX_SLOPE_DB_DEC: float = 40.0       # clamp for the extrapolated parasitic slope
+PARASITIC_MARGIN_DB: float = 10.0              # required distance of valid points above the parasitic level
+
+
+def find_passband_anchor(log_f: np.ndarray, mag_db: np.ndarray) -> int:
+    slope_db_per_dec = np.abs(np.gradient(mag_db, log_f))
+    candidates = np.where(mag_db >= np.max(mag_db) - PASSBAND_CANDIDATE_DB)[0]
+    return int(candidates[np.argmin(slope_db_per_dec[candidates])])
+
+
+def estimate_parasitic_level(
+    log_f: np.ndarray, mag_db: np.ndarray, dip_idx: int, step: int,
+) -> Callable[[int], float]:
+    """Fit the parasitic trend beyond the dip and return level(index) in dB.
+    Points right after the dip are still lowered by the cancellation, so the fit uses
+    the window PARASITIC_FIT_START_DEC … +PARASITIC_LEVEL_WINDOW_DEC beyond the dip,
+    where the parasitic path clearly dominates. Falls back to closer points if needed."""
+    all_idx = np.arange(len(mag_db))
+    outward_dist = (log_f[all_idx] - log_f[dip_idx]) * step
+    beyond = all_idx[(outward_dist >= PARASITIC_FIT_START_DEC)
+                     & (outward_dist <= PARASITIC_FIT_START_DEC + PARASITIC_LEVEL_WINDOW_DEC)]
+    if len(beyond) < 2:
+        beyond = all_idx[((all_idx - dip_idx) * step >= 2) & (outward_dist <= PARASITIC_LEVEL_WINDOW_DEC)]
+    if len(beyond) == 0:
+        beyond = np.array([i for i in (dip_idx + step,) if 0 <= i < len(mag_db)], dtype=int)
+    if len(beyond) == 0:
+        flat_level = float(mag_db[dip_idx])
+        return lambda _i: flat_level
+
+    center_log_f = float(np.mean(log_f[beyond]))
+    center_level = float(np.mean(mag_db[beyond]))
+    outward_slope = 0.0
+    if len(beyond) >= 2:
+        outward_slope = float(np.polyfit(log_f[beyond], mag_db[beyond], 1)[0]) * step
+        # The parasitic path must not grow towards the passband; limit the extrapolation
+        outward_slope = float(np.clip(outward_slope, 0.0, PARASITIC_MAX_SLOPE_DB_DEC))
+    return lambda i: center_level + outward_slope * (log_f[i] - center_log_f) * step
+
+
+def find_reliable_boundary(
+    log_f: np.ndarray, mag_db: np.ndarray, phase_deg: np.ndarray, below_floor: np.ndarray,
+    anchor_idx: int, step: int, stopband_level_db: float,
+) -> int:
+    """Walk from anchor_idx in direction step (+1 = higher f, -1 = lower f) and
+    return the last index that still belongs to the real filter response."""
+    n_points = len(mag_db)
+    entry_idx: Optional[int] = None
+    min_idx = extreme_idx = anchor_idx
+    phase_trend = 0
+    trigger_idx: Optional[int] = None
+    floor_hit = False
+
+    idx = anchor_idx + step
+    while 0 <= idx < n_points:
+        if below_floor[idx]:
+            trigger_idx, floor_hit = idx, True
+            break
+        if entry_idx is None:
+            if mag_db[idx] < stopband_level_db:
+                entry_idx = min_idx = extreme_idx = idx
+                travel = phase_deg[idx] - phase_deg[anchor_idx]
+                phase_trend = int(np.sign(travel)) if abs(travel) >= PARASITIC_PHASE_TREND_MIN_DEG else 0
+        else:
+            if mag_db[idx] < mag_db[min_idx]:
+                min_idx = idx
+            if phase_trend and (phase_deg[idx] - phase_deg[extreme_idx]) * phase_trend > 0:
+                extreme_idx = idx
+            magnitude_rises = mag_db[idx] > mag_db[min_idx] + PARASITIC_MAG_RISE_DB
+            phase_reverses = bool(phase_trend) and (
+                (phase_deg[extreme_idx] - phase_deg[idx]) * phase_trend > PARASITIC_PHASE_REVERSAL_DEG
+            )
+            if magnitude_rises or phase_reverses:
+                trigger_idx = idx
+                break
+        idx += step
+
+    if trigger_idx is None:
+        return idx - step                      # reached the end of the sweep undisturbed
+    if entry_idx is None:
+        return max(trigger_idx - step, anchor_idx) if step > 0 else min(trigger_idx - step, anchor_idx)
+
+    # Dip = lowest point from the stopband entry up to half a decade beyond the trigger
+    region = np.arange(len(mag_db))
+    region = region[((region - entry_idx) * step >= 0)
+                    & ((log_f[region] - log_f[trigger_idx]) * step <= PARASITIC_LEVEL_WINDOW_DEC)]
+    dip_idx = int(region[np.argmin(mag_db[region])])
+    start_idx = dip_idx - step
+    if floor_hit and (trigger_idx - dip_idx) * step <= 0:
+        start_idx = trigger_idx - step         # never beyond the ADC-floor point
+
+    parasitic_level = estimate_parasitic_level(log_f, mag_db, dip_idx, step)
+    idx = start_idx
+    while idx != anchor_idx and mag_db[idx] < parasitic_level(idx) + PARASITIC_MARGIN_DB:
+        idx -= step
+    return idx
+
+
+log_freqs_array = np.log10(freqs_array)
+noise_floor_amplitude_v = PARASITIC_MIN_AMPLITUDE_LSB * np.array(raw_vdiv_ch2) / ADC_COUNTS_PER_DIV
+below_noise_floor = amps2_array < noise_floor_amplitude_v
+
+passband_anchor_idx = find_passband_anchor(log_freqs_array, mag_db_array)
+stopband_level_db = float(mag_db_array[passband_anchor_idx]) - PARASITIC_STOPBAND_GATE_DB
+left_boundary_idx = find_reliable_boundary(
+    log_freqs_array, mag_db_array, unwrapped_phase_array, below_noise_floor,
+    passband_anchor_idx, -1, stopband_level_db,
+)
+right_boundary_idx = find_reliable_boundary(
+    log_freqs_array, mag_db_array, unwrapped_phase_array, below_noise_floor,
+    passband_anchor_idx, +1, stopband_level_db,
+)
+
+valid_slice = slice(left_boundary_idx, right_boundary_idx + 1)
+f_valid = freqs_array[valid_slice]
+mag_valid = mag_db_array[valid_slice]
+phase_valid = unwrapped_phase_array[valid_slice]
+
+# Parasitic segments share their boundary point with the valid curve so the lines connect
+parasitic_segments: List[slice] = []
+if left_boundary_idx > 0:
+    parasitic_segments.append(slice(0, left_boundary_idx + 1))
+if right_boundary_idx < len(freqs_array) - 1:
+    parasitic_segments.append(slice(right_boundary_idx, len(freqs_array)))
+
+print(
+    f"[ANALYSIS] Reliable range: {format_frequency(freqs_array[left_boundary_idx])} – "
+    f"{format_frequency(freqs_array[right_boundary_idx])} "
+    f"(down to {float(np.min(mag_valid)):.1f} dB)"
+)
+
+# --- Filter character & -3 dB cutoff (evaluated on the reliable range only) ---
+# Low-pass has high gain at the start and low at the end; high-pass is vice versa.
+start_gain_median = float(np.median(mag_valid[:5]))
+end_gain_median = float(np.median(mag_valid[-5:]))
 is_highpass = end_gain_median > (start_gain_median + 6.0)
 
-passband_reference_db = float(np.percentile(mag_db_array, 90))
+passband_reference_db = float(np.percentile(mag_valid, 90))
 cutoff_target_db = passband_reference_db - 3.01
 detected_cutoff_hz: Optional[float] = None
-idx_cutoff_band: int = 0
 
-crossing_indices = np.where(np.diff(mag_db_array >= cutoff_target_db))[0]
+crossing_indices = np.where(np.diff(mag_valid >= cutoff_target_db))[0]
 if len(crossing_indices) > 0:
-    # Pick the appropriate transition point
-    idx_cutoff_band = crossing_indices[0] if is_highpass else crossing_indices[-1]
-    f_lower, f_upper = freqs_array[idx_cutoff_band], freqs_array[idx_cutoff_band + 1]
-    g_lower, g_upper = mag_db_array[idx_cutoff_band], mag_db_array[idx_cutoff_band + 1]
+    idx_cutoff_band = int(crossing_indices[0] if is_highpass else crossing_indices[-1])
+    f_lower, f_upper = f_valid[idx_cutoff_band], f_valid[idx_cutoff_band + 1]
+    g_lower, g_upper = mag_valid[idx_cutoff_band], mag_valid[idx_cutoff_band + 1]
     if g_upper != g_lower:
         log_fc = np.interp(
             cutoff_target_db,
@@ -495,38 +868,6 @@ if len(crossing_indices) > 0:
             [np.log10(f_lower), np.log10(f_upper)] if g_lower < g_upper else [np.log10(f_upper), np.log10(f_lower)],
         )
         detected_cutoff_hz = 10.0**log_fc
-
-# --- Bidirectional Noise Floor / Parasitic Limit Detection ---
-# Identifies points dominated by ADC quantization floor or crosstalk (< -36 dB or < ~0.9 LSB of CH2).
-# 0.9 LSB = 18 mV at 0.5 V/div; scales with the CH2 V/div read from the scope.
-noise_floor_amplitude_v = 0.9 * vdiv_ch2 / ADC_COUNTS_PER_DIV
-noise_floor_mask = (mag_db_array <= -36.0) | (amps2_array < noise_floor_amplitude_v)
-
-if is_highpass:
-    # Stopband is at LOW frequencies (left side)
-    # Search backwards from cutoff to find where reliable passband/transition ends
-    stopband_indices = np.where(noise_floor_mask & (np.arange(len(mag_db_array)) <= idx_cutoff_band))[0]
-    left_boundary_idx = int(np.max(stopband_indices)) if len(stopband_indices) > 0 else 0
-
-    f_valid = freqs_array[left_boundary_idx:]
-    mag_valid = mag_db_array[left_boundary_idx:]
-    phase_valid = unwrapped_phase_array[left_boundary_idx:]
-
-    f_parasitic = freqs_array[:left_boundary_idx+1]
-    mag_parasitic = mag_db_array[:left_boundary_idx+1]
-    phase_parasitic = unwrapped_phase_array[:left_boundary_idx+1]
-else:
-    # Low-pass: Stopband is at HIGH frequencies (right side)
-    stopband_indices = np.where(noise_floor_mask & (np.arange(len(mag_db_array)) >= idx_cutoff_band))[0]
-    right_boundary_idx = int(np.min(stopband_indices)) if len(stopband_indices) > 0 else len(mag_db_array) - 1
-
-    f_valid = freqs_array[:right_boundary_idx+1]
-    mag_valid = mag_db_array[:right_boundary_idx+1]
-    phase_valid = unwrapped_phase_array[:right_boundary_idx+1]
-
-    f_parasitic = freqs_array[right_boundary_idx:]
-    mag_parasitic = mag_db_array[right_boundary_idx:]
-    phase_parasitic = unwrapped_phase_array[right_boundary_idx:]
 
 
 # ==============================================================================
@@ -600,9 +941,10 @@ ax_oscilloscope.legend(loc="upper right")
 
 # --- 2. Bode Magnitude Axis ---
 ax_magnitude.semilogx(f_valid, mag_valid, color="tab:blue", lw=2.0, label="Magnitude Response")
-if len(f_parasitic) > 0:
+for segment_no, segment in enumerate(parasitic_segments):
     ax_magnitude.semilogx(
-        f_parasitic, mag_parasitic, color="crimson", lw=2.0, linestyle="--", label="Parasitic / Noise"
+        freqs_array[segment], mag_db_array[segment], color="crimson", lw=2.0, linestyle="--",
+        label="Parasitic / Noise" if segment_no == 0 else None,
     )
 
 cursor_mag_marker, = ax_magnitude.plot([initial_record["freq_hz"]], [mag_db_array[0]], "ro", ms=7)
@@ -622,8 +964,10 @@ ax_magnitude.legend(loc="lower left" if is_highpass else "lower left", fontsize=
 
 # --- 3. Bode Phase Axis ---
 ax_phase.semilogx(f_valid, phase_valid, color="tab:orange", lw=2.0, label="Phase Response")
-if len(f_parasitic) > 0:
-    ax_phase.semilogx(f_parasitic, phase_parasitic, color="crimson", lw=2.0, linestyle="--")
+for segment in parasitic_segments:
+    ax_phase.semilogx(
+        freqs_array[segment], unwrapped_phase_array[segment], color="crimson", lw=2.0, linestyle="--"
+    )
 
 cursor_phase_marker, = ax_phase.plot([initial_record["freq_hz"]], [unwrapped_phase_array[0]], "ro", ms=7)
 cursor_phase_vline = ax_phase.axvline(initial_record["freq_hz"], color="red", linestyle=":", alpha=0.8)
@@ -660,13 +1004,13 @@ def build_oscilloscope_title(record: Dict[str, Any], gain_db: float) -> str:
     title = (
         f"Frequency: {format_frequency(record['freq_hz'])} | "
         f"Timebase: {get_scaled_timebase(record):.1f} {record['time_unit']}/Div | "
-        f"{vdiv_ch1:g} / {vdiv_ch2:g} V/Div\n"
+        f"V/Div: {format_vdiv(record['vdiv_ch1'])} / {format_vdiv(record['vdiv_ch2'])}\n"
         f"CH1: {record['vpp_ch1']:.2f} Vpp | CH2: {record['vpp_ch2']*1000:.1f} mVpp | "
         f"Gain: {gain_db:.1f} dB"
     )
     clipped = [name for name, key in (("CH1", "clipped_ch1"), ("CH2", "clipped_ch2")) if record[key]]
     if clipped:
-        title += f" | ⚠ {' + '.join(clipped)} übersteuert"
+        title += f" | ⚠ {' + '.join(clipped)} clipped"
     return title
 
 
