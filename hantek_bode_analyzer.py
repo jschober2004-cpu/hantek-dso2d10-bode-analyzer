@@ -19,6 +19,8 @@ Key Features:
    - Correctly anchors phase lead (Delta-t < 0 / CH2 ahead) and phase lag (Delta-t > 0).
 5. Dynamic Axis Scaling:
    - Voltage axis follows the largest measured peak; phase axis follows the reliable range.
+6. Bode Plot Export:
+   - "Save Bode Plot" button saves only the two Bode diagrams (PNG/PDF/SVG).
 """
 
 from __future__ import annotations
@@ -29,7 +31,8 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+from matplotlib.transforms import Bbox
+from matplotlib.widgets import Button, Slider
 import numpy as np
 import pyvisa
 
@@ -1134,5 +1137,75 @@ def on_slider_update(val: float) -> None:
 
 on_slider_update(0)
 slider_control.on_changed(on_slider_update)
+
+
+# ==============================================================================
+# Bode Plot Export ("Save Bode Plot" button)
+# ==============================================================================
+
+EXPORT_DPI: int = 200
+EXPORT_PADDING_IN: float = 0.15
+EXPORT_FILETYPES = (
+    ("PNG image", "*.png"),
+    ("PDF document", "*.pdf"),
+    ("SVG vector graphic", "*.svg"),
+)
+slider_cursor_artists = (cursor_mag_marker, cursor_mag_vline, cursor_phase_marker, cursor_phase_vline)
+
+
+def export_bode_plot(path: str) -> None:
+    """Save only the two Bode diagrams (magnitude + phase, incl. titles, labels and
+    legends). The slider cursor (red dot / dotted line) is hidden for the export."""
+    previous_visibility = [artist.get_visible() for artist in slider_cursor_artists]
+    for artist in slider_cursor_artists:
+        artist.set_visible(False)
+    try:
+        figure.canvas.draw()
+        renderer = figure.canvas.get_renderer()
+        bode_bbox = Bbox.union([axis.get_tightbbox(renderer) for axis in (ax_magnitude, ax_phase)])
+        bode_bbox_inches = bode_bbox.transformed(figure.dpi_scale_trans.inverted()).padded(EXPORT_PADDING_IN)
+        figure.savefig(path, dpi=EXPORT_DPI, bbox_inches=bode_bbox_inches, facecolor="white")
+    finally:
+        for artist, visible in zip(slider_cursor_artists, previous_visibility):
+            artist.set_visible(visible)
+        figure.canvas.draw_idle()
+
+
+def ask_export_path() -> Optional[str]:
+    """File dialog (Tk) with a timestamped default name; falls back to the working
+    directory if no Tk dialog is available (e.g. other Matplotlib backends)."""
+    default_name = time.strftime("bode_plot_%Y%m%d_%H%M%S.png")
+    try:
+        from tkinter import filedialog
+        parent = figure.canvas.get_tk_widget() if hasattr(figure.canvas, "get_tk_widget") else None
+        chosen = filedialog.asksaveasfilename(
+            parent=parent,
+            title="Save Bode Plot",
+            initialfile=default_name,
+            defaultextension=".png",
+            filetypes=EXPORT_FILETYPES,
+        )
+        return chosen or None
+    except Exception:
+        return default_name
+
+
+def on_save_clicked(_event: Any) -> None:
+    path = ask_export_path()
+    if not path:
+        return
+    try:
+        export_bode_plot(path)
+        print(f"[EXPORT] Bode plot saved to {path}")
+        save_button.label.set_text("Saved ✓")
+    except Exception as export_err:
+        print(f"[EXPORT] Saving failed: {export_err}")
+        save_button.label.set_text("Save failed")
+    figure.canvas.draw_idle()
+
+
+ax_save_button = figure.add_axes([0.80, 0.015, 0.15, 0.045])
+save_button = Button(ax_save_button, "Save Bode Plot", color="0.92", hovercolor="0.80")
+save_button.on_clicked(on_save_clicked)
 
 plt.show()

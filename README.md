@@ -21,6 +21,7 @@ An automated Frequency Response Analyzer (FRA) that turns a budget **Hantek DSO2
 * **Trend-Based Parasitic Detection (both sides):** Starting in the passband (the highest *flat* region, so a parasitic rise at the band edge is not mistaken for it), the response is followed towards lower *and* higher frequencies, so low-pass, high-pass and band-pass stopbands are handled alike. Parasitic coupling (ground inductance, crosstalk, capacitor ESL) is detected where, in the stopband, the magnitude rises again, the phase reverses its trend, or CH2 falls below the ADC resolution. The parasitic trend beyond the resulting dip is extrapolated back towards the passband, and only points at least 10 dB above it are kept as valid (simulated edge error ≤ approx. 4 dB / 20°). The −3 dB cutoff is searched only within this valid range. The rest is drawn as a dashed red trajectory. No fixed dB threshold is used.
 * **True Zero-Crossing Phase Dimensioning:** Live $\Delta t$ phase dimensioning using sub-sample linear interpolation to dynamically measure both phase lag ($\Delta\varphi < 0^\circ$) and phase lead ($\Delta\varphi > 0^\circ$) near the window center without baseline clutter.
 * **Interactive Inspection Dashboard:** Real-time synchronized time-domain oscilloscope traces and frequency-domain Bode plots driven by an embedded Matplotlib slider.
+* **Bode Plot Export:** The **Save Bode Plot** button exports only the two Bode diagrams (magnitude and phase, incl. cutoff markers and legends, without the slider cursor) as PNG, PDF or SVG.
 
 ---
 
@@ -81,6 +82,9 @@ python hantek_bode_analyzer.py
 The **Sweep Settings** dialog asks for the number of measurement points, the frequency range (e.g. `10`, `1.5k`, `25M`, `2.5 MHz`), the generator amplitude and whether Auto-V/div is used, and shows an estimated sweep duration. The defaults (100 points, 10 Hz – 25 MHz, 2 Vpp, Auto-V/div on) are sufficient for simple filters. Low frequencies dominate the sweep time, so starting at e.g. 100 Hz shortens the sweep noticeably. Fewer points are faster, but the curves become more polygonal and $f_c$ less accurate.
 
 The console shows the progress (gain and CH2 V/div per point), any clipped points and the reliable frequency range (`[ANALYSIS] Reliable range: …`).
+
+### 5. Inspect & Export
+Use the **Frequency Step** slider to step through the measured points: the left panel shows the captured CH1/CH2 waveforms with the $\Delta t$ measurement, the red dot marks the point in the Bode diagrams. Click **Save Bode Plot** (bottom right) to export the two Bode diagrams; a file dialog suggests a timestamped name such as `bode_plot_20261113_183000.png` (PNG at 200 dpi, PDF or SVG).
 
 ---
 

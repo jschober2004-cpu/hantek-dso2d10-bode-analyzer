@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Exported Bode plots (Save Bode Plot button)
+bode_plot_*.png
+bode_plot_*.pdf
+bode_plot_*.svg
