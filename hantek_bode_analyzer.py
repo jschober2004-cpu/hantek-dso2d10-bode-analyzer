@@ -14,7 +14,7 @@ Key Features:
    - Parasitic takeover detected by magnitude rise, phase reversal or ADC floor;
      valid points must lie 10 dB above the extrapolated parasitic level.
    - -3 dB cutoff evaluated within the reliable range only.
-4. Sub-Sample Interpolated Zero-Crossing Dimensioning (Delta-t):
+4. Sub-Sample Interpolated Zero-Crossing Phase Measurement (Delta-t):
    - Computes real rising zero-crossings for both CH1 and CH2 via linear interpolation.
    - Correctly anchors phase lead (Delta-t < 0 / CH2 ahead) and phase lag (Delta-t > 0).
 5. Dynamic Axis Scaling:

@@ -6,7 +6,9 @@
 
 An automated Frequency Response Analyzer (FRA) that turns a budget **Hantek DSO2D10** oscilloscope and its integrated DDS function generator into a full-featured Bode plotting testbench via USB/SCPI.
 
-![Dashboard Preview](dashboard_preview.png)
+![Dashboard preview: measurement of a 2nd-order RC high-pass filter](dashboard_preview.png)
+
+*Example measurement: 2nd-order RC high-pass filter (100 Hz – 25 MHz).*
 
 ---
 
@@ -19,7 +21,7 @@ An automated Frequency Response Analyzer (FRA) that turns a budget **Hantek DSO2
 * **Coherent Hann-Windowed Single-Bin DFT:** Projects captured time-domain buffers onto continuous orthogonal carriers to extract precise magnitude and phase with strongly suppressed spectral leakage and without filter-type assumptions.
 * **Automated Cutoff Detection:** Accurately determines the $-3\,\text{dB}$ cutoff frequency ($f_c$) and passband phase angle using sub-bin logarithmic interpolation.
 * **Trend-Based Parasitic Detection (both sides):** Starting in the passband (the highest *flat* region, so a parasitic rise at the band edge is not mistaken for it), the response is followed towards lower *and* higher frequencies, so low-pass, high-pass and band-pass stopbands are handled alike. Parasitic coupling (ground inductance, crosstalk, capacitor ESL) is detected where, in the stopband, the magnitude rises again, the phase reverses its trend, or CH2 falls below the ADC resolution. The parasitic trend beyond the resulting dip is extrapolated back towards the passband, and only points at least 10 dB above it are kept as valid (simulated edge error ≤ approx. 4 dB / 20°). The −3 dB cutoff is searched only within this valid range. The rest is drawn as a dashed red trajectory. No fixed dB threshold is used.
-* **True Zero-Crossing Phase Dimensioning:** Live $\Delta t$ phase dimensioning using sub-sample linear interpolation to dynamically measure both phase lag ($\Delta\varphi < 0^\circ$) and phase lead ($\Delta\varphi > 0^\circ$) near the window center without baseline clutter.
+* **True Zero-Crossing Phase Measurement:** Live Δt phase measurement using sub-sample linear interpolation to dynamically measure both phase lag (Δφ < 0°) and phase lead (Δφ > 0°) near the window center without baseline clutter.
 * **Interactive Inspection Dashboard:** Real-time synchronized time-domain oscilloscope traces and frequency-domain Bode plots driven by an embedded Matplotlib slider.
 * **Bode Plot Export:** The **Save Bode Plot** button exports only the two Bode diagrams (magnitude and phase, incl. cutoff markers and legends, without the slider cursor) as PNG, PDF or SVG.
 
@@ -35,7 +37,7 @@ An automated Frequency Response Analyzer (FRA) that turns a budget **Hantek DSO2
 | **Automated -3 dB Cutoff Detection** | ✅ Validated | Logarithmic interpolation between sweep points, evaluated within the reliable range only (use more points for higher accuracy) |
 | **Parasitic Crosstalk Handling** | ✅ Validated | Trend-based boundary (magnitude rise / phase reversal / ADC limit) with 10 dB margin to the extrapolated parasitic level |
 | **Bandpass** | 🧪 Simulated | Parasitic detection works on both sides; only one −3 dB cutoff is reported so far |
-| **Active Filters (Sallen-Key, MFB)** | ⏳ In Progress | Validation for circuits with passband gain ($> 0\text{ dB}$) |
+| **Active Filters (Sallen-Key, MFB)** | ⏳ In Progress | Validation for circuits with passband gain (above 0 dB) |
 | **Notch Topologies & Shelving / Lag-Lead Networks** | 📋 Planned | Their non-monotonic phase may trigger the parasitic detection too early |
 
 ---
